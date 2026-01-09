@@ -27,6 +27,9 @@ RUN apk add --update --no-cache catatonit
 # Final stage with explicit platform specification
 FROM python:3.13-alpine
 
+# Install Node.js and npm for npx-based MCP servers
+RUN apk add --no-cache nodejs npm
+
 COPY --from=uv --chown=app:app /app/.venv /app/.venv
 COPY --from=uv /usr/bin/catatonit /usr/bin/
 COPY --from=uv /usr/libexec/podman/catatonit /usr/libexec/podman/
