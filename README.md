@@ -409,6 +409,32 @@ Examples:
 }
 ```
 
+## Building for tech-advisors (Octopus Chat)
+
+This is a fork used by Octopus Chat. To build and push the image to ghcr.io/tech-advisors/mcp-proxy:
+
+```bash
+# Login to GHCR (one-time)
+echo $GITHUB_TOKEN | docker login ghcr.io -u USERNAME --password-stdin
+
+# Build and push multi-arch image
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -t ghcr.io/tech-advisors/mcp-proxy:latest \
+    -f Dockerfile \
+    . \
+    --push
+
+# Or with a specific version tag
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -t ghcr.io/tech-advisors/mcp-proxy:v1.0.0 \
+    -t ghcr.io/tech-advisors/mcp-proxy:latest \
+    -f Dockerfile \
+    . \
+    --push
+```
+
 ## Testing
 
 Check the `mcp-proxy` server by running it with the `mcp-server-fetch` server. You can use

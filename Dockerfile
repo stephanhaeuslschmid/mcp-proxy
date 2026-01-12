@@ -30,6 +30,21 @@ FROM python:3.13-alpine
 # Install Node.js and npm for npx-based MCP servers
 RUN apk add --no-cache nodejs npm
 
+# Install Go for Go-based MCP servers (e.g., mcp-imagen-go)
+RUN apk add --no-cache go git
+
+# Build mcp-gemini-go from Vertex AI Creative Studio (for gemini-3-pro-image-preview)
+# Source: https://github.com/GoogleCloudPlatform/vertex-ai-creative-studio
+# Note: Can't use 'go install' due to replace directives in go.mod, must build from source
+RUN git clone --depth 1 https://github.com/GoogleCloudPlatform/vertex-ai-creative-studio.git /tmp/vertex-ai-creative-studio && \
+    cd /tmp/vertex-ai-creative-studio/experiments/mcp-genmedia/mcp-genmedia-go/mcp-gemini-go && \
+    go build -o /usr/local/bin/mcp-gemini-go . && \
+    rm -rf /tmp/vertex-ai-creative-studio
+
+# Copy uv/uvx for Python-based MCP servers (e.g., mcp-server-odoo)
+COPY --from=uv /usr/local/bin/uv /usr/local/bin/uv
+COPY --from=uv /usr/local/bin/uvx /usr/local/bin/uvx
+
 COPY --from=uv --chown=app:app /app/.venv /app/.venv
 COPY --from=uv /usr/bin/catatonit /usr/bin/
 COPY --from=uv /usr/libexec/podman/catatonit /usr/libexec/podman/
