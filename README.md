@@ -212,6 +212,41 @@ The JSON file should follow this structure:
 - `enabled`: (Optional) If `false`, this server definition will be skipped. Defaults to `true`.
 - `timeout` and `transportType`: These fields are present in standard MCP client configurations but are currently **ignored** by `mcp-proxy` when loading named servers. The transport type is implicitly "stdio".
 
+## Process Pool for Dynamic Servers
+
+When using `headerToEnv` configuration for servers that require per-request environment variables (e.g., OAuth tokens), the proxy normally spawns a new process for each request. This can lead to significant latency (~2-3 seconds per request).
+
+The Process Pool feature caches and reuses processes with identical environment variables, dramatically reducing latency for subsequent requests from the same user.
+
+### How it works
+
+1. When a request comes in, the proxy generates a cache key based on the server name and environment variables
+2. If a cached process with the same key exists and is healthy, it's reused (cache hit: ~50ms)
+3. If not, a new process is spawned (cache miss: ~2-3s)
+4. Idle processes are automatically cleaned up after a configurable timeout
+
+### Configuration
+
+| Environment Variable | Default | Description |
+| --- | --- | --- |
+| `PROCESS_POOL_ENABLED` | `true` | Enable/disable the process pool feature |
+| `PROCESS_POOL_IDLE_TIMEOUT` | `600` | Seconds after which idle processes are terminated |
+| `PROCESS_POOL_MAX_SIZE` | `100` | Maximum number of processes to cache |
+
+### Performance
+
+| Scenario | Without Pool | With Pool |
+| --- | --- | --- |
+| First request (User A) | ~2-3s | ~2-3s |
+| Second request (User A, same token) | ~2-3s | ~50ms |
+| Request (User B, different token) | ~2-3s | ~2-3s |
+
+### Logging
+
+The proxy logs cache hits and misses:
+- `INFO: Process cache hit for <server_name> (key: <first 8 chars of hash>)`
+- `INFO: Process cache miss for <server_name>, starting new process`
+
 ## Installation
 
 ### Installing via PyPI

@@ -21,6 +21,13 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import Receive, Scope, Send
 
+from .process_pool import (
+    PROCESS_POOL_ENABLED,
+    ProcessHandle,
+    get_process_pool,
+    init_process_pool,
+    shutdown_process_pool,
+)
 from .proxy_server import create_proxy_server
 
 logger = logging.getLogger(__name__)
@@ -96,9 +103,10 @@ def create_dynamic_server_routes(
 ) -> list[BaseRoute]:
     """Create routes for a server that spawns processes on-demand with header-based env vars.
 
-    This is used for servers with headerToEnv configuration. Each request spawns a new
-    stdio process with environment variables extracted from HTTP headers, executes the
-    MCP operation, and then terminates the process.
+    This is used for servers with headerToEnv configuration. When PROCESS_POOL_ENABLED,
+    processes with identical env vars are cached and reused. Otherwise, each request
+    spawns a new stdio process with environment variables extracted from HTTP headers,
+    executes the MCP operation, and then terminates the process.
 
     Args:
         server_name: Name of the server for logging
@@ -109,6 +117,108 @@ def create_dynamic_server_routes(
     Returns:
         List of Starlette routes for this dynamic server
     """
+
+    async def handle_dynamic_sse_pooled(request: Request) -> Response:
+        """Handle SSE requests using pooled processes."""
+        _update_global_activity()
+
+        # Extract env vars from headers
+        header_env_vars = _extract_header_env_vars(request, header_mapping)
+
+        pool = get_process_pool()
+        process_handle: ProcessHandle | None = None
+
+        try:
+            process_handle = await pool.get_or_create(
+                server_name=server_name,
+                params=params,
+                header_env_vars=header_env_vars,
+            )
+
+            proxy = await create_proxy_server(process_handle.session)
+
+            sse_transport = SseServerTransport("/messages/")
+            async with sse_transport.connect_sse(
+                request.scope,
+                request.receive,
+                request._send,  # noqa: SLF001
+            ) as (read_stream, write_stream):
+                await proxy.run(
+                    read_stream,
+                    write_stream,
+                    proxy.create_initialization_options(),
+                )
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.warning(
+                "Connection error for %s, invalidating cached process: %s",
+                server_name,
+                e,
+            )
+            if process_handle:
+                await pool.invalidate(process_handle.cache_key)
+            raise
+        finally:
+            if process_handle:
+                await process_handle.release()
+
+        return Response()
+
+    async def handle_dynamic_mcp_pooled(scope: Scope, receive: Receive, send: Send) -> None:
+        """Handle StreamableHTTP requests using pooled processes."""
+        _update_global_activity()
+
+        # Create a Request object to extract headers
+        request = Request(scope, receive, send)
+        header_env_vars = _extract_header_env_vars(request, header_mapping)
+
+        pool = get_process_pool()
+        process_handle: ProcessHandle | None = None
+
+        try:
+            process_handle = await pool.get_or_create(
+                server_name=server_name,
+                params=params,
+                header_env_vars=header_env_vars,
+            )
+
+            proxy = await create_proxy_server(process_handle.session)
+
+            http_session_manager = StreamableHTTPSessionManager(
+                app=proxy,
+                event_store=None,
+                json_response=True,
+                stateless=stateless_instance,
+            )
+
+            async with http_session_manager.run():
+                # Normalize path if needed
+                updated_scope = scope
+                if scope.get("type") == "http":
+                    path = scope.get("path", "")
+                    if path and path.rstrip("/").endswith("/mcp") and not path.endswith("/"):
+                        updated_scope = dict(scope)
+                        updated_scope["path"] = path + "/"
+                        raw_path = scope.get("raw_path")
+                        if raw_path:
+                            if b"?" in raw_path:
+                                path_part, query_part = raw_path.split(b"?", 1)
+                                updated_scope["raw_path"] = path_part.rstrip(b"/") + b"/?" + query_part
+                            else:
+                                updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
+
+                await http_session_manager.handle_request(updated_scope, receive, send)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.warning(
+                "Connection error for %s, invalidating cached process: %s",
+                server_name,
+                e,
+            )
+            if process_handle:
+                await pool.invalidate(process_handle.cache_key)
+            raise
+        finally:
+            if process_handle:
+                await process_handle.release()
 
     async def handle_dynamic_sse(request: Request) -> Response:
         """Handle SSE requests by spawning a process with header-derived env vars."""
@@ -209,15 +319,27 @@ def create_dynamic_server_routes(
 
                 await http_session_manager.handle_request(updated_scope, receive, send)
 
+    # Choose handlers based on pool enabled status
+    if PROCESS_POOL_ENABLED:
+        logger.info(
+            "Process pool enabled for server %s",
+            server_name,
+        )
+        mcp_handler = handle_dynamic_mcp_pooled
+        sse_handler = handle_dynamic_sse_pooled
+    else:
+        mcp_handler = handle_dynamic_mcp
+        sse_handler = handle_dynamic_sse
+
     routes = [
         Route(
             "/mcp",
-            endpoint=_ASGIEndpointAdapter(handle_dynamic_mcp),
+            endpoint=_ASGIEndpointAdapter(mcp_handler),
             methods=HTTP_METHODS,
             include_in_schema=False,
         ),
-        Mount("/mcp", app=handle_dynamic_mcp),
-        Route("/sse", endpoint=handle_dynamic_sse),
+        Mount("/mcp", app=mcp_handler),
+        Route("/sse", endpoint=sse_handler),
     ]
     return routes
 
@@ -319,6 +441,18 @@ async def run_mcp_server(
     all_routes: list[BaseRoute] = [
         Route("/status", endpoint=_handle_status),  # Global status endpoint
     ]
+
+    # Check if any server uses headerToEnv (needs process pool)
+    has_dynamic_servers = any(
+        name in header_mappings and header_mappings[name]
+        for name in (named_server_params or {})
+    )
+
+    # Initialize process pool if enabled and needed
+    if PROCESS_POOL_ENABLED and has_dynamic_servers:
+        await init_process_pool()
+        logger.info("Process pool initialized for dynamic servers")
+
     # Use AsyncExitStack to manage lifecycles of multiple components
     async with contextlib.AsyncExitStack() as stack:
         # Manage lifespans of all StreamableHTTPSessionManagers
@@ -328,6 +462,9 @@ async def run_mcp_server(
             # All http_session_managers' .run() are already entered into the stack
             yield
             logger.info("Main application lifespan shutting down...")
+            # Shutdown process pool
+            if PROCESS_POOL_ENABLED and has_dynamic_servers:
+                await shutdown_process_pool()
 
         # Setup default server if configured
         if default_server_params:
