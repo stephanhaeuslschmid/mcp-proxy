@@ -5,6 +5,7 @@ This module provides functionality to load named server configurations from JSON
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from mcp.client.stdio import StdioServerParameters
@@ -12,10 +13,45 @@ from mcp.client.stdio import StdioServerParameters
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ProxySettings:
+    """Global settings for the MCP proxy."""
+
+    process_pool_enabled: bool = True
+    process_pool_idle_timeout: int = 600
+    process_pool_max_size: int = 100
+
+
+def load_settings_from_config(config_file_path: str | Path) -> ProxySettings:
+    """Load global settings from config.json.
+
+    Args:
+        config_file_path: Path to the JSON configuration file.
+
+    Returns:
+        ProxySettings with values from config or defaults.
+    """
+    try:
+        with Path(config_file_path).open() as f:
+            config_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        logger.debug("Could not load settings from config, using defaults")
+        return ProxySettings()
+
+    settings = config_data.get("settings", {})
+    pool_settings = settings.get("processPool", {})
+
+    return ProxySettings(
+        process_pool_enabled=pool_settings.get("enabled", True),
+        process_pool_idle_timeout=pool_settings.get("idleTimeout", 600),
+        process_pool_max_size=pool_settings.get("maxSize", 100),
+    )
+
+
 def load_named_server_configs_from_file(
     config_file_path: str | Path,
     base_env: dict[str, str],
-) -> tuple[dict[str, StdioServerParameters], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, StdioServerParameters], dict[str, dict[str, str]], dict[str, list[str]]]:
     """Loads named server configurations from a JSON file.
 
     Args:
@@ -26,6 +62,7 @@ def load_named_server_configs_from_file(
         A tuple containing:
         - A dictionary of named server parameters
         - A dictionary of header-to-environment mappings for each server
+        - A dictionary of header-to-args mappings for each server (list of header names)
 
     Raises:
         FileNotFoundError: If the config file is not found.
@@ -34,6 +71,7 @@ def load_named_server_configs_from_file(
     """
     named_stdio_params: dict[str, StdioServerParameters] = {}
     header_mappings: dict[str, dict[str, str]] = {}
+    args_mappings: dict[str, list[str]] = {}
     logger.info("Loading named server configurations from: %s", config_file_path)
 
     try:
@@ -74,6 +112,7 @@ def load_named_server_configs_from_file(
         command_args = server_config.get("args", [])
         env = server_config.get("env", {})
         header_to_env = server_config.get("headerToEnv", {})
+        header_to_args = server_config.get("headerToArgs", [])
 
         if not command:
             logger.warning(
@@ -93,6 +132,12 @@ def load_named_server_configs_from_file(
                 name,
             )
             continue
+        if not isinstance(header_to_args, list):
+            logger.warning(
+                "Named server '%s' from config has invalid 'headerToArgs' (must be a list). Skipping.",
+                name,
+            )
+            continue
 
         new_env = base_env.copy()
         new_env.update(env)
@@ -108,12 +153,17 @@ def load_named_server_configs_from_file(
         if header_to_env:
             header_mappings[name] = header_to_env
 
+        # Store header-to-args mapping for this server
+        if header_to_args:
+            args_mappings[name] = header_to_args
+
         logger.info(
-            "Configured named server '%s' from config: %s %s (header mappings: %s)",
+            "Configured named server '%s' from config: %s %s (header env mappings: %s, header arg mappings: %s)",
             name,
             command,
             " ".join(command_args),
             list(header_to_env.keys()) if header_to_env else "none",
+            header_to_args if header_to_args else "none",
         )
 
-    return named_stdio_params, header_mappings
+    return named_stdio_params, header_mappings, args_mappings

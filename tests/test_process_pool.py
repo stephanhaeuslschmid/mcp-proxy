@@ -71,7 +71,6 @@ class TestCachedProcess:
             created_at=datetime.now(timezone.utc),
             last_used=datetime.now(timezone.utc),
             exit_stack=MagicMock(),
-            stdio_streams=(MagicMock(), MagicMock()),
             session=MagicMock(),
         )
 
@@ -84,6 +83,21 @@ class TestCachedProcess:
         assert cached.is_in_use
         cached.decrement_ref()
         assert not cached.is_in_use
+
+    def test_mark_for_removal(self) -> None:
+        """Test marking process for lazy removal."""
+        cached = CachedProcess(
+            server_name="test",
+            cache_key="key123",
+            created_at=datetime.now(timezone.utc),
+            last_used=datetime.now(timezone.utc),
+            exit_stack=MagicMock(),
+            session=MagicMock(),
+        )
+
+        assert not cached.is_marked_for_removal
+        cached.mark_for_removal()
+        assert cached.is_marked_for_removal
 
 
 class TestProcessPool:
@@ -433,58 +447,10 @@ class TestProcessPool:
 
         await pool.shutdown()
 
-    @patch("mcp_proxy.process_pool.stdio_client")
-    @patch("mcp_proxy.process_pool.ClientSession")
-    async def test_dead_process_removed_on_get(
-        self,
-        mock_session_class: MagicMock,
-        mock_stdio: MagicMock,
-        pool: ProcessPool,
-        mock_params: StdioServerParameters,
-    ) -> None:
-        """Test that dead processes are removed when accessed."""
-        # Setup mocks - first call returns live process, second call creates new
-        mock_reader = MagicMock()
-        mock_writer = MagicMock()
-
-        mock_stdio_context = AsyncMock()
-        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
-        mock_stdio_context.__aexit__.return_value = None
-        mock_stdio.return_value = mock_stdio_context
-
-        mock_session = MagicMock()
-        mock_session.initialize = AsyncMock()
-        mock_session_context = AsyncMock()
-        mock_session_context.__aenter__.return_value = mock_session
-        mock_session_context.__aexit__.return_value = None
-        mock_session_class.return_value = mock_session_context
-
-        await pool.start()
-
-        # First call - process is alive
-        mock_reader.at_eof.return_value = False
-        handle1 = await pool.get_or_create(
-            server_name="test-server",
-            params=mock_params,
-            header_env_vars={"TOKEN": "test123"},
-        )
-        await handle1.release()
-
-        # Simulate process death
-        mock_reader.at_eof.return_value = True
-
-        # Second call - should detect dead process and create new
-        handle2 = await pool.get_or_create(
-            server_name="test-server",
-            params=mock_params,
-            header_env_vars={"TOKEN": "test123"},
-        )
-
-        # Should have created a new process (2 calls total)
-        assert mock_stdio.call_count == 2
-
-        await handle2.release()
-        await pool.shutdown()
+    # Note: test_dead_process_removed_on_get was removed because the process pool
+    # does not actively check for dead processes via at_eof(). Instead, the caller
+    # (mcp_server.py) catches exceptions and calls invalidate() to remove dead processes.
+    # Dead process detection is handled by the caller's error handling, not the pool itself.
 
 
 class TestProcessHandle:
@@ -532,6 +498,7 @@ class TestGlobalPoolFunctions:
         """Test that get_process_pool returns singleton."""
         # Clear any existing pool
         import mcp_proxy.process_pool as pp
+
         pp._process_pool = None
 
         pool1 = get_process_pool()
@@ -545,6 +512,7 @@ class TestGlobalPoolFunctions:
     async def test_init_and_shutdown_process_pool(self) -> None:
         """Test init and shutdown of global pool."""
         import mcp_proxy.process_pool as pp
+
         pp._process_pool = None
 
         pool = await init_process_pool()
@@ -555,17 +523,17 @@ class TestGlobalPoolFunctions:
 
 
 class TestIdleCleanup:
-    """Tests for idle process cleanup."""
+    """Tests for idle process cleanup (lazy cleanup pattern)."""
 
     @patch("mcp_proxy.process_pool.stdio_client")
     @patch("mcp_proxy.process_pool.ClientSession")
     @patch("mcp_proxy.process_pool.PROCESS_POOL_CLEANUP_INTERVAL", 0.1)
-    async def test_idle_process_cleanup(
+    async def test_idle_process_marked_for_removal(
         self,
         mock_session_class: MagicMock,
         mock_stdio: MagicMock,
     ) -> None:
-        """Test that idle processes are cleaned up after timeout."""
+        """Test that idle processes are marked for lazy cleanup."""
         pool = ProcessPool(idle_timeout=1, max_size=5)  # 1 second timeout
 
         # Setup mocks
@@ -606,10 +574,78 @@ class TestIdleCleanup:
         cache_key = handle.cache_key
         pool._pool[cache_key].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
 
-        # Run cleanup manually
+        # Run cleanup manually - this only MARKS the process, doesn't remove it yet
         await pool._cleanup_idle_processes()
 
+        # Process is still in pool but marked for removal
+        assert pool.get_cached_count() == 1
+        assert pool._pool[cache_key].is_marked_for_removal
+
+        # Actual cleanup happens during next get_or_create (lazy cleanup)
+        await pool._cleanup_marked_processes()
+
+        # Now it should be removed
         assert pool.get_cached_count() == 0
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    @patch("mcp_proxy.process_pool.PROCESS_POOL_CLEANUP_INTERVAL", 0.1)
+    async def test_lazy_cleanup_on_get_or_create(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that lazy cleanup happens during get_or_create."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create first process
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "token1"},
+        )
+        await handle1.release()
+
+        # Mark it for removal
+        cache_key1 = handle1.cache_key
+        pool._pool[cache_key1].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await pool._cleanup_idle_processes()
+        assert pool._pool[cache_key1].is_marked_for_removal
+
+        # Create second process with different token - this triggers lazy cleanup
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "token2"},
+        )
+        await handle2.release()
+
+        # First process should be cleaned up, second should be cached
+        assert pool.get_cached_count() == 1
+        assert cache_key1 not in pool._pool
 
         await pool.shutdown()
 
@@ -682,7 +718,7 @@ class TestConcurrency:
         mock_reader.at_eof.return_value = False
         mock_writer = MagicMock()
 
-        async def slow_enter() -> tuple[MagicMock, MagicMock]:
+        async def slow_enter(_: MagicMock) -> tuple[MagicMock, MagicMock]:
             await asyncio.sleep(0.1)  # Simulate slow startup
             return (mock_reader, mock_writer)
 
@@ -751,8 +787,9 @@ class TestIntegration:
         mock_reader.at_eof.return_value = False
         mock_writer = MagicMock()
 
-        async def timed_enter() -> tuple[MagicMock, MagicMock]:
+        async def timed_enter(_: MagicMock) -> tuple[MagicMock, MagicMock]:
             import time
+
             call_times.append(time.time())
             return (mock_reader, mock_writer)
 
@@ -865,7 +902,7 @@ class TestIntegration:
 
         session_index = [0]
 
-        async def get_session() -> MagicMock:
+        async def get_session(_: MagicMock) -> MagicMock:
             idx = session_index[0]
             session_index[0] += 1
             return sessions[idx % len(sessions)]

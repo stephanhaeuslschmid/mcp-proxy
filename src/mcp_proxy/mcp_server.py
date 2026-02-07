@@ -22,10 +22,10 @@ from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import Receive, Scope, Send
 
 from .process_pool import (
-    PROCESS_POOL_ENABLED,
     ProcessHandle,
     get_process_pool,
     init_process_pool,
+    is_pool_enabled,
     shutdown_process_pool,
 )
 from .proxy_server import create_proxy_server
@@ -95,23 +95,48 @@ def _extract_header_env_vars(
     return env_vars
 
 
+def _extract_header_args(
+    request: Request,
+    header_to_args: list[str],
+) -> list[str]:
+    """Extract CLI arguments from request headers.
+
+    Args:
+        request: The incoming HTTP request
+        header_to_args: List of HTTP header names to extract as CLI arguments
+
+    Returns:
+        List of argument values from headers (in order of header_to_args)
+    """
+    args: list[str] = []
+    for header_name in header_to_args:
+        value = request.headers.get(header_name)
+        if value:
+            args.append(value)
+            logger.debug("Mapped header %s to arg", header_name)
+    return args
+
+
 def create_dynamic_server_routes(
     server_name: str,
     params: StdioServerParameters,
     header_mapping: dict[str, str],
+    header_to_args: list[str],
     stateless_instance: bool,
 ) -> list[BaseRoute]:
     """Create routes for a server that spawns processes on-demand with header-based env vars.
 
-    This is used for servers with headerToEnv configuration. When PROCESS_POOL_ENABLED,
-    processes with identical env vars are cached and reused. Otherwise, each request
-    spawns a new stdio process with environment variables extracted from HTTP headers,
-    executes the MCP operation, and then terminates the process.
+    This is used for servers with headerToEnv or headerToArgs configuration.
+    When is_pool_enabled(), processes with identical env vars and args are cached
+    and reused. Otherwise, each request spawns a new stdio process with environment
+    variables and/or arguments extracted from HTTP headers, executes the MCP operation,
+    and then terminates the process.
 
     Args:
         server_name: Name of the server for logging
-        params: Base stdio parameters (env vars from headers will be merged)
+        params: Base stdio parameters (env vars and args from headers will be merged)
         header_mapping: Mapping of HTTP header names to environment variable names
+        header_to_args: List of HTTP header names to extract as CLI arguments
         stateless_instance: Whether to run in stateless mode
 
     Returns:
@@ -122,8 +147,9 @@ def create_dynamic_server_routes(
         """Handle SSE requests using pooled processes."""
         _update_global_activity()
 
-        # Extract env vars from headers
+        # Extract env vars and args from headers
         header_env_vars = _extract_header_env_vars(request, header_mapping)
+        header_args = _extract_header_args(request, header_to_args)
 
         pool = get_process_pool()
         process_handle: ProcessHandle | None = None
@@ -133,6 +159,7 @@ def create_dynamic_server_routes(
                 server_name=server_name,
                 params=params,
                 header_env_vars=header_env_vars,
+                extra_args=header_args,
             )
 
             proxy = await create_proxy_server(process_handle.session)
@@ -170,6 +197,7 @@ def create_dynamic_server_routes(
         # Create a Request object to extract headers
         request = Request(scope, receive, send)
         header_env_vars = _extract_header_env_vars(request, header_mapping)
+        header_args = _extract_header_args(request, header_to_args)
 
         pool = get_process_pool()
         process_handle: ProcessHandle | None = None
@@ -179,6 +207,7 @@ def create_dynamic_server_routes(
                 server_name=server_name,
                 params=params,
                 header_env_vars=header_env_vars,
+                extra_args=header_args,
             )
 
             proxy = await create_proxy_server(process_handle.session)
@@ -202,7 +231,9 @@ def create_dynamic_server_routes(
                         if raw_path:
                             if b"?" in raw_path:
                                 path_part, query_part = raw_path.split(b"?", 1)
-                                updated_scope["raw_path"] = path_part.rstrip(b"/") + b"/?" + query_part
+                                updated_scope["raw_path"] = (
+                                    path_part.rstrip(b"/") + b"/?" + query_part
+                                )
                             else:
                                 updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
 
@@ -221,27 +252,32 @@ def create_dynamic_server_routes(
                 await process_handle.release()
 
     async def handle_dynamic_sse(request: Request) -> Response:
-        """Handle SSE requests by spawning a process with header-derived env vars."""
+        """Handle SSE requests by spawning a process with header-derived env vars and args."""
         _update_global_activity()
 
-        # Extract env vars from headers
+        # Extract env vars and args from headers
         header_env_vars = _extract_header_env_vars(request, header_mapping)
+        header_args = _extract_header_args(request, header_to_args)
 
         # Merge with base env vars
         merged_env = (params.env or {}).copy()
         merged_env.update(header_env_vars)
 
+        # Merge with base args
+        merged_args = list(params.args) + header_args
+
         dynamic_params = StdioServerParameters(
             command=params.command,
-            args=params.args,
+            args=merged_args,
             env=merged_env,
             cwd=params.cwd,
         )
 
         logger.info(
-            "Spawning dynamic process for %s with %d header-derived env vars",
+            "Spawning dynamic process for %s with %d header-derived env vars and %d extra args",
             server_name,
             len(header_env_vars),
+            len(header_args),
         )
 
         # Spawn process, handle request, then cleanup
@@ -265,28 +301,33 @@ def create_dynamic_server_routes(
         return Response()
 
     async def handle_dynamic_mcp(scope: Scope, receive: Receive, send: Send) -> None:
-        """Handle StreamableHTTP requests by spawning a process with header-derived env vars."""
+        """Handle StreamableHTTP requests by spawning a process with header-derived env vars and args."""
         _update_global_activity()
 
         # Create a Request object to extract headers
         request = Request(scope, receive, send)
         header_env_vars = _extract_header_env_vars(request, header_mapping)
+        header_args = _extract_header_args(request, header_to_args)
 
         # Merge with base env vars
         merged_env = (params.env or {}).copy()
         merged_env.update(header_env_vars)
 
+        # Merge with base args
+        merged_args = list(params.args) + header_args
+
         dynamic_params = StdioServerParameters(
             command=params.command,
-            args=params.args,
+            args=merged_args,
             env=merged_env,
             cwd=params.cwd,
         )
 
         logger.info(
-            "Spawning dynamic process for %s with %d header-derived env vars",
+            "Spawning dynamic process for %s with %d header-derived env vars and %d extra args",
             server_name,
             len(header_env_vars),
+            len(header_args),
         )
 
         async with contextlib.AsyncExitStack() as stack:
@@ -313,14 +354,16 @@ def create_dynamic_server_routes(
                         if raw_path:
                             if b"?" in raw_path:
                                 path_part, query_part = raw_path.split(b"?", 1)
-                                updated_scope["raw_path"] = path_part.rstrip(b"/") + b"/?" + query_part
+                                updated_scope["raw_path"] = (
+                                    path_part.rstrip(b"/") + b"/?" + query_part
+                                )
                             else:
                                 updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
 
                 await http_session_manager.handle_request(updated_scope, receive, send)
 
     # Choose handlers based on pool enabled status
-    if PROCESS_POOL_ENABLED:
+    if is_pool_enabled():
         logger.info(
             "Process pool enabled for server %s",
             server_name,
@@ -421,6 +464,7 @@ async def run_mcp_server(
     default_server_params: StdioServerParameters | None = None,
     named_server_params: dict[str, StdioServerParameters] | None = None,
     header_mappings: dict[str, dict[str, str]] | None = None,
+    args_mappings: dict[str, list[str]] | None = None,
 ) -> None:
     """Run stdio client(s) and expose an MCP server with multiple possible backends.
 
@@ -432,24 +476,31 @@ async def run_mcp_server(
             For servers with header mappings, HTTP headers will be extracted
             and passed as environment variables to the stdio process.
             Example: {"brave-search": {"X-Brave-Api-Key": "BRAVE_API_KEY"}}
+        args_mappings: Mapping of server names to header->args mappings.
+            For servers with args mappings, HTTP headers will be extracted
+            and appended as CLI arguments to the stdio process.
+            Example: {"filesystem": ["X-Workspace-Path"]}
     """
     if named_server_params is None:
         named_server_params = {}
     if header_mappings is None:
         header_mappings = {}
+    if args_mappings is None:
+        args_mappings = {}
 
     all_routes: list[BaseRoute] = [
         Route("/status", endpoint=_handle_status),  # Global status endpoint
     ]
 
-    # Check if any server uses headerToEnv (needs process pool)
+    # Check if any server uses headerToEnv or headerToArgs (needs process pool)
     has_dynamic_servers = any(
-        name in header_mappings and header_mappings[name]
+        (name in header_mappings and header_mappings[name])
+        or (name in args_mappings and args_mappings[name])
         for name in (named_server_params or {})
     )
 
     # Initialize process pool if enabled and needed
-    if PROCESS_POOL_ENABLED and has_dynamic_servers:
+    if is_pool_enabled() and has_dynamic_servers:
         await init_process_pool()
         logger.info("Process pool initialized for dynamic servers")
 
@@ -463,7 +514,7 @@ async def run_mcp_server(
             yield
             logger.info("Main application lifespan shutting down...")
             # Shutdown process pool
-            if PROCESS_POOL_ENABLED and has_dynamic_servers:
+            if is_pool_enabled() and has_dynamic_servers:
                 await shutdown_process_pool()
 
         # Setup default server if configured
@@ -487,11 +538,16 @@ async def run_mcp_server(
 
         # Setup named servers
         for name, params in named_server_params.items():
-            # Check if this server has header mappings (dynamic mode)
-            if name in header_mappings and header_mappings[name]:
+            # Check if this server has header mappings or args mappings (dynamic mode)
+            has_header_env = name in header_mappings and header_mappings[name]
+            has_header_args = name in args_mappings and args_mappings[name]
+
+            if has_header_env or has_header_args:
                 logger.info(
-                    "Setting up dynamic named server '%s' with headerToEnv: %s %s",
+                    "Setting up dynamic named server '%s' with headerToEnv=%s, headerToArgs=%s: %s %s",
                     name,
+                    bool(has_header_env),
+                    bool(has_header_args),
                     params.command,
                     " ".join(params.args),
                 )
@@ -499,7 +555,8 @@ async def run_mcp_server(
                 dynamic_routes = create_dynamic_server_routes(
                     server_name=name,
                     params=params,
-                    header_mapping=header_mappings[name],
+                    header_mapping=header_mappings.get(name, {}),
+                    header_to_args=args_mappings.get(name, []),
                     stateless_instance=mcp_settings.stateless,
                 )
                 server_mount = Mount(f"/servers/{name}", routes=dynamic_routes)

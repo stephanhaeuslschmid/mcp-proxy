@@ -30,6 +30,9 @@ FROM python:3.13-alpine
 # Install Node.js and npm for npx-based MCP servers
 RUN apk add --no-cache nodejs npm
 
+# Pre-install frequently used MCP servers globally for faster startup
+RUN npm install -g @modelcontextprotocol/server-filesystem
+
 # Install Go for Go-based MCP servers (e.g., mcp-imagen-go)
 RUN apk add --no-cache go git
 

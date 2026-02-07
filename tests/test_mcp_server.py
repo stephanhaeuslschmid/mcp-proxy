@@ -346,15 +346,15 @@ async def test_run_mcp_server_with_named_servers(
         assert mock_create_proxy.call_count == 2
         assert mock_create_routes.call_count == 2
 
-        # Check that named servers were logged
+        # Check that named servers were logged (static mode - no header mappings)
         mock_logger.info.assert_any_call(
-            "Setting up named server '%s': %s %s",
+            "Setting up static named server '%s': %s %s",
             "server1",
             mock_stdio_params.command,
             " ".join(mock_stdio_params.args),
         )
         mock_logger.info.assert_any_call(
-            "Setting up named server '%s': %s %s",
+            "Setting up static named server '%s': %s %s",
             "server2",
             "python",
             "-m mcp_server",
@@ -571,7 +571,8 @@ async def test_run_mcp_server_global_status_updates(
         assert "default" in _global_status["server_instances"]
         assert "test_server" in _global_status["server_instances"]
         assert _global_status["server_instances"]["default"] == "configured"
-        assert _global_status["server_instances"]["test_server"] == "configured"
+        # Named servers without header mappings are static
+        assert _global_status["server_instances"]["test_server"] == "static"
 
 
 async def test_run_mcp_server_sse_url_logging(
@@ -681,7 +682,7 @@ async def test_run_mcp_server_both_default_and_named_servers(
             " ".join(mock_stdio_params.args),
         )
         mock_logger.info.assert_any_call(
-            "Setting up named server '%s': %s %s",
+            "Setting up static named server '%s': %s %s",
             "named_server",
             mock_stdio_params.command,
             " ".join(mock_stdio_params.args),
