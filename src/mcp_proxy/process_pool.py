@@ -91,8 +91,9 @@ class CachedProcess:
     cache_key: str
     created_at: datetime
     last_used: datetime
-    exit_stack: contextlib.AsyncExitStack
     session: ClientSession
+    _shutdown_event: asyncio.Event
+    _owner_task: asyncio.Task[None]
     _reference_count: int = field(default=0, init=False)
     _marked_for_removal: bool = field(default=False, init=False)
 
@@ -189,6 +190,56 @@ class ProcessPool:
         self._shutdown_event = asyncio.Event()
         self._started = False
 
+    async def _start_process(
+        self,
+        server_name: str,
+        params: StdioServerParameters,
+    ) -> tuple[ClientSession, asyncio.Event, asyncio.Task[None]]:
+        """Start a process in a dedicated owner task.
+
+        The owner task holds the AsyncExitStack context open.
+        Cleanup happens by setting the shutdown event, which
+        causes the owner task to exit its context (same task = no cancel scope error).
+        """
+        loop = asyncio.get_running_loop()
+        session_future: asyncio.Future[ClientSession] = loop.create_future()
+        shutdown_event = asyncio.Event()
+
+        async def _owner() -> None:
+            try:
+                async with contextlib.AsyncExitStack() as stack:
+                    stdio_streams = await stack.enter_async_context(stdio_client(params))
+                    session = await stack.enter_async_context(ClientSession(*stdio_streams))
+                    await session.initialize()
+                    session_future.set_result(session)
+                    # Keep context alive until shutdown is requested
+                    await shutdown_event.wait()
+                # exit_stack.__aexit__ runs here — SAME TASK
+            except Exception as exc:
+                if not session_future.done():
+                    session_future.set_exception(exc)
+                else:
+                    logger.exception("Owner task error for %s", server_name)
+
+        owner_task = asyncio.create_task(_owner(), name=f"owner-{server_name}")
+        session = await session_future  # Wait until process is ready
+        return session, shutdown_event, owner_task
+
+    async def _terminate_process(self, cached: CachedProcess, timeout: float = 5.0) -> None:
+        """Terminate a cached process by signaling its owner task."""
+        cached._shutdown_event.set()
+        try:
+            await asyncio.wait_for(cached._owner_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for %s owner task, cancelling", cached.server_name)
+            cached._owner_task.cancel()
+            try:
+                await cached._owner_task
+            except asyncio.CancelledError:
+                pass
+        except Exception:
+            logger.exception("Error terminating %s", cached.server_name)
+
     async def start(self) -> None:
         """Start the background cleanup task."""
         if self._started:
@@ -275,10 +326,10 @@ class ProcessPool:
             for key in marked_keys:
                 to_cleanup.append(self._pool.pop(key))
 
-        # Close outside lock to avoid blocking other requests
+        # Terminate outside lock to avoid blocking other requests
         for cached in to_cleanup:
             try:
-                await cached.exit_stack.aclose()
+                await self._terminate_process(cached)
                 logger.info(
                     "Lazy cleanup completed for %s (key: %s)",
                     cached.server_name,
@@ -358,10 +409,10 @@ class ProcessPool:
                         _cached_process=cached,
                     )
 
-        # Cleanup marked process outside lock (in request-task context)
+        # Cleanup marked process outside lock
         if marked_process_to_cleanup:
             try:
-                await marked_process_to_cleanup.exit_stack.aclose()
+                await self._terminate_process(marked_process_to_cleanup)
                 logger.info(
                     "Cleaned up marked process for %s (key: %s)",
                     marked_process_to_cleanup.server_name,
@@ -388,49 +439,47 @@ class ProcessPool:
             cwd=params.cwd,
         )
 
-        exit_stack = contextlib.AsyncExitStack()
         try:
-            stdio_streams = await exit_stack.enter_async_context(stdio_client(dynamic_params))
-            session = await exit_stack.enter_async_context(ClientSession(*stdio_streams))
-
-            # Initialize the session
-            await session.initialize()
-
-            now = datetime.now(timezone.utc)
-            cached_process = CachedProcess(
-                server_name=server_name,
-                cache_key=cache_key,
-                created_at=now,
-                last_used=now,
-                exit_stack=exit_stack,
-                session=session,
-            )
-            cached_process.increment_ref()
-
-            # Add to cache if not at max size (need lock for pool modification)
-            async with self._lock:
-                if len(self._pool) < self._max_size:
-                    self._pool[cache_key] = cached_process
-                    logger.debug(
-                        "Process pool: %d cached processes",
-                        len(self._pool),
-                    )
-                else:
-                    logger.warning(
-                        "Process pool at max size (%d), not caching new process for %s",
-                        self._max_size,
-                        server_name,
-                    )
-
-            return ProcessHandle(
-                session=session,
-                cache_key=cache_key,
-                _pool=self,
-                _cached_process=cached_process,
+            session, shutdown_event, owner_task = await self._start_process(
+                server_name, dynamic_params,
             )
         except Exception:
-            await exit_stack.aclose()
+            logger.exception("Failed to start process for %s", server_name)
             raise
+
+        now = datetime.now(timezone.utc)
+        cached_process = CachedProcess(
+            server_name=server_name,
+            cache_key=cache_key,
+            created_at=now,
+            last_used=now,
+            session=session,
+            _shutdown_event=shutdown_event,
+            _owner_task=owner_task,
+        )
+        cached_process.increment_ref()
+
+        # Add to cache if not at max size (need lock for pool modification)
+        async with self._lock:
+            if len(self._pool) < self._max_size:
+                self._pool[cache_key] = cached_process
+                logger.debug(
+                    "Process pool: %d cached processes",
+                    len(self._pool),
+                )
+            else:
+                logger.warning(
+                    "Process pool at max size (%d), not caching new process for %s",
+                    self._max_size,
+                    server_name,
+                )
+
+        return ProcessHandle(
+            session=session,
+            cache_key=cache_key,
+            _pool=self,
+            _cached_process=cached_process,
+        )
 
     async def invalidate(self, cache_key: str) -> None:
         """Remove and terminate a cached process.
@@ -438,21 +487,24 @@ class ProcessPool:
         Args:
             cache_key: The cache key of the process to invalidate
         """
+        cached: CachedProcess | None = None
         async with self._lock:
             if cache_key in self._pool:
                 cached = self._pool.pop(cache_key)
-                logger.info(
-                    "Invalidating process for %s (key: %s)",
+
+        if cached:
+            logger.info(
+                "Invalidating process for %s (key: %s)",
+                cached.server_name,
+                cache_key[:8],
+            )
+            try:
+                await self._terminate_process(cached)
+            except Exception:
+                logger.exception(
+                    "Error closing invalidated process for %s",
                     cached.server_name,
-                    cache_key[:8],
                 )
-                try:
-                    await cached.exit_stack.aclose()
-                except Exception:
-                    logger.exception(
-                        "Error closing invalidated process for %s",
-                        cached.server_name,
-                    )
 
     def get_cached_count(self) -> int:
         """Get the number of currently cached processes.
@@ -477,11 +529,7 @@ class ProcessPool:
             except asyncio.CancelledError:
                 pass
 
-        # Close all cached processes
-        # Note: This may trigger anyio cancel scope errors since we're in a
-        # different task than where the processes were created. However, the
-        # subprocesses will still be terminated by the OS when we exit.
-        # See: https://github.com/modelcontextprotocol/python-sdk/issues/577
+        # Terminate all cached processes via their owner tasks
         async with self._lock:
             for cache_key, cached in list(self._pool.items()):
                 logger.debug(
@@ -490,24 +538,7 @@ class ProcessPool:
                     cache_key[:8],
                 )
                 try:
-                    await asyncio.wait_for(cached.exit_stack.aclose(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Timeout waiting for process %s to terminate",
-                        cached.server_name,
-                    )
-                except RuntimeError as e:
-                    if "cancel scope" in str(e):
-                        # Known anyio limitation - process will still be cleaned up by OS
-                        logger.debug(
-                            "Ignoring anyio cancel scope error during shutdown for %s (known issue)",
-                            cached.server_name,
-                        )
-                    else:
-                        logger.exception(
-                            "Error shutting down process for %s",
-                            cached.server_name,
-                        )
+                    await self._terminate_process(cached)
                 except Exception:
                     logger.exception(
                         "Error shutting down process for %s",

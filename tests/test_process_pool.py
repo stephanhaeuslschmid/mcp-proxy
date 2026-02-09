@@ -70,8 +70,9 @@ class TestCachedProcess:
             cache_key="key123",
             created_at=datetime.now(timezone.utc),
             last_used=datetime.now(timezone.utc),
-            exit_stack=MagicMock(),
             session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(spec=asyncio.Task),
         )
 
         assert not cached.is_in_use
@@ -91,8 +92,9 @@ class TestCachedProcess:
             cache_key="key123",
             created_at=datetime.now(timezone.utc),
             last_used=datetime.now(timezone.utc),
-            exit_stack=MagicMock(),
             session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(spec=asyncio.Task),
         )
 
         assert not cached.is_marked_for_removal
@@ -698,6 +700,117 @@ class TestIdleCleanup:
 
         await handle.release()
         await pool.shutdown()
+
+
+class TestOwnerTaskCleanup:
+    """Tests for owner task pattern (cancel scope bug fix)."""
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_cleanup_no_cancel_scope_error(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that cleanup works without RuntimeError (cancel scope)."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create a process
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+        await handle.release()
+
+        assert pool.get_cached_count() == 1
+
+        # Mark it idle and run cleanup — this should NOT raise RuntimeError
+        cache_key = handle.cache_key
+        pool._pool[cache_key].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await pool._cleanup_idle_processes()
+        assert pool._pool[cache_key].is_marked_for_removal
+
+        # Actual cleanup via _cleanup_marked_processes — no cancel scope error
+        await pool._cleanup_marked_processes()
+
+        assert pool.get_cached_count() == 0
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_shutdown_terminates_owner_tasks(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that shutdown properly terminates all owner tasks."""
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create two processes
+        handle1 = await pool.get_or_create(
+            server_name="server-a",
+            params=params,
+            header_env_vars={"TOKEN": "token1"},
+        )
+        await handle1.release()
+
+        handle2 = await pool.get_or_create(
+            server_name="server-b",
+            params=params,
+            header_env_vars={"TOKEN": "token2"},
+        )
+        await handle2.release()
+
+        assert pool.get_cached_count() == 2
+
+        # Shutdown should cleanly terminate both — no RuntimeError
+        await pool.shutdown()
+
+        assert pool.get_cached_count() == 0
 
 
 class TestConcurrency:
