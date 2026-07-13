@@ -1,11 +1,15 @@
 """Process pool for caching and reusing MCP server processes with identical env vars."""
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import json
 import logging
 import os
+import re
+import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -13,6 +17,74 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 logger = logging.getLogger(__name__)
+
+# Trailing stderr lines kept per process start so a startup crash can report its cause
+STDERR_TAIL_LINES = 40
+# Cap for the extracted one-line error summary
+ERROR_SUMMARY_MAX_LEN = 300
+# How long to wait for the stderr pump to drain after a startup failure
+_STDERR_DRAIN_TIMEOUT = 2.0
+
+# Lines that look like the final message of a traceback, e.g.
+# "oracledb.exceptions.DatabaseError: ORA-01017: invalid username/password"
+# or Node-style "Error: connect ECONNREFUSED 10.0.0.1:443"
+_ERROR_LINE_RE = re.compile(r"[\w.]*(?:Error|Exception)\w*:\s")
+
+
+class ProcessStartError(RuntimeError):
+    """Raised when an MCP server process fails to spawn or initialize."""
+
+    def __init__(self, server_name: str, summary: str, stderr_tail: str) -> None:
+        """Initialize the error.
+
+        Args:
+            server_name: Name of the MCP server that failed to start
+            summary: One-line cause extracted from the process stderr
+            stderr_tail: The captured trailing stderr lines (joined)
+        """
+        message = f"MCP server process for '{server_name}' failed to start"
+        if summary:
+            message = f"{message}: {summary}"
+        super().__init__(message)
+        self.server_name = server_name
+        self.summary = summary
+        self.stderr_tail = stderr_tail
+
+
+def extract_error_summary(stderr_lines: list[str]) -> str:
+    """Extract the most meaningful error line from captured stderr.
+
+    Scans backwards for the last line that looks like an exception message,
+    stripping anyio exception-group decorations ("| ...", "+---"). Falls back
+    to the last non-empty line.
+
+    Args:
+        stderr_lines: Captured stderr lines, oldest first
+
+    Returns:
+        A one-line error summary, or an empty string if stderr was empty.
+    """
+    cleaned: list[str] = []
+    for raw in stderr_lines:
+        line = raw.strip().lstrip("|+-").strip()
+        if line:
+            cleaned.append(line)
+    if not cleaned:
+        return ""
+    for line in reversed(cleaned):
+        if _ERROR_LINE_RE.match(line):
+            return line[:ERROR_SUMMARY_MAX_LEN]
+    return cleaned[-1][:ERROR_SUMMARY_MAX_LEN]
+
+
+def _leaf_exception_message(exc: BaseException) -> str:
+    """Unwrap nested exception groups down to the first leaf exception message."""
+    # Duck-typed instead of isinstance(exc, BaseExceptionGroup) to stay
+    # compatible with ruff target versions below py311.
+    while sub_exceptions := getattr(exc, "exceptions", None):
+        exc = sub_exceptions[0]
+    return str(exc)
+
 
 # Configuration from environment variables (can be overridden by config.json)
 _DEFAULT_IDLE_TIMEOUT = int(os.environ.get("PROCESS_POOL_IDLE_TIMEOUT", "600"))
@@ -200,15 +272,50 @@ class ProcessPool:
         The owner task holds the AsyncExitStack context open.
         Cleanup happens by setting the shutdown event, which
         causes the owner task to exit its context (same task = no cancel scope error).
+
+        The child's stderr is teed through a pipe: every line is forwarded to our
+        own stderr (so it still lands in the pod logs) while a bounded tail is
+        kept in memory. If the process fails to start, that tail carries the real
+        cause (e.g. the DB error from a crashed server) into ProcessStartError.
         """
         loop = asyncio.get_running_loop()
         session_future: asyncio.Future[ClientSession] = loop.create_future()
         shutdown_event = asyncio.Event()
 
+        stderr_tail: collections.deque[str] = collections.deque(maxlen=STDERR_TAIL_LINES)
+        pump_done = threading.Event()
+        read_fd, write_fd = os.pipe()
+        errlog = os.fdopen(write_fd, "w", encoding="utf-8", errors="replace")
+
+        def _pump_stderr() -> None:
+            try:
+                with os.fdopen(read_fd, "r", encoding="utf-8", errors="replace") as reader:
+                    for line in reader:
+                        sys.stderr.write(line)
+                        stderr_tail.append(line.rstrip("\n"))
+                sys.stderr.flush()
+            finally:
+                pump_done.set()
+
+        # Dedicated daemon thread (not the shared executor): it blocks for the
+        # whole lifetime of the child process.
+        threading.Thread(
+            target=_pump_stderr,
+            name=f"stderr-pump-{server_name}",
+            daemon=True,
+        ).start()
+
         async def _owner() -> None:
             try:
                 async with contextlib.AsyncExitStack() as stack:
-                    stdio_streams = await stack.enter_async_context(stdio_client(params))
+                    try:
+                        stdio_streams = await stack.enter_async_context(
+                            stdio_client(params, errlog=errlog),
+                        )
+                    finally:
+                        # The child inherited its own copy of the pipe (or spawning
+                        # failed) — close ours so the pump sees EOF when it exits.
+                        errlog.close()
                     session = await stack.enter_async_context(ClientSession(*stdio_streams))
                     await session.initialize()
                     session_future.set_result(session)
@@ -217,7 +324,15 @@ class ProcessPool:
                 # exit_stack.__aexit__ runs here — SAME TASK
             except Exception as exc:
                 if not session_future.done():
-                    session_future.set_exception(exc)
+                    # The exit stack is closed (child terminated) — give the pump
+                    # a moment to drain the remaining stderr, then report the cause.
+                    await loop.run_in_executor(None, pump_done.wait, _STDERR_DRAIN_TIMEOUT)
+                    summary = extract_error_summary(list(stderr_tail))
+                    if not summary:
+                        summary = _leaf_exception_message(exc)
+                    error = ProcessStartError(server_name, summary, "\n".join(stderr_tail))
+                    error.__cause__ = exc
+                    session_future.set_exception(error)
                 else:
                     logger.exception("Owner task error for %s", server_name)
 
@@ -441,7 +556,8 @@ class ProcessPool:
 
         try:
             session, shutdown_event, owner_task = await self._start_process(
-                server_name, dynamic_params,
+                server_name,
+                dynamic_params,
             )
         except Exception:
             logger.exception("Failed to start process for %s", server_name)

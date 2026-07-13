@@ -23,6 +23,7 @@ from starlette.types import Receive, Scope, Send
 
 from .process_pool import (
     ProcessHandle,
+    ProcessStartError,
     get_process_pool,
     init_process_pool,
     is_pool_enabled,
@@ -71,6 +72,24 @@ HTTP_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRA
 async def _handle_status(_: Request) -> Response:
     """Global health check and service usage monitoring endpoint."""
     return JSONResponse(_global_status)
+
+
+def _process_start_error_response(server_name: str, exc: ProcessStartError) -> JSONResponse:
+    """Build the 502 response for a failed MCP server process start.
+
+    Carries the real cause (e.g. the DB error of a crashed stdio server) to the
+    caller instead of an opaque 500. The "error" field is a sentinel the Octopus
+    API matches on to surface the message in the UI.
+    """
+    logger.warning("Process start failed for %s: %s", server_name, exc)
+    return JSONResponse(
+        {
+            "error": "mcp_process_start_failed",
+            "server": server_name,
+            "message": exc.summary or str(exc),
+        },
+        status_code=502,
+    )
 
 
 def _extract_header_env_vars(
@@ -175,6 +194,8 @@ def create_dynamic_server_routes(
                     write_stream,
                     proxy.create_initialization_options(),
                 )
+        except ProcessStartError as e:
+            return _process_start_error_response(server_name, e)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.warning(
                 "Connection error for %s, invalidating cached process: %s",
@@ -238,6 +259,11 @@ def create_dynamic_server_routes(
                                 updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
 
                 await http_session_manager.handle_request(updated_scope, receive, send)
+        except ProcessStartError as e:
+            # get_or_create failed before any response bytes were sent, so we
+            # can still answer with a proper error payload.
+            response = _process_start_error_response(server_name, e)
+            await response(scope, receive, send)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.warning(
                 "Connection error for %s, invalidating cached process: %s",

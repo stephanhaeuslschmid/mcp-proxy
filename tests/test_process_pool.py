@@ -2,6 +2,7 @@
 # ruff: noqa: PLR2004
 
 import asyncio
+import sys
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,9 +10,12 @@ import pytest
 from mcp.client.stdio import StdioServerParameters
 
 from mcp_proxy.process_pool import (
+    ERROR_SUMMARY_MAX_LEN,
     CachedProcess,
     ProcessHandle,
     ProcessPool,
+    ProcessStartError,
+    extract_error_summary,
     generate_cache_key,
     get_process_pool,
     init_process_pool,
@@ -1103,3 +1107,97 @@ class TestIntegration:
         assert pool.get_cached_count() == 2
 
         await pool.shutdown()
+
+
+class TestExtractErrorSummary:
+    """Tests for extract_error_summary."""
+
+    def test_empty_lines(self) -> None:
+        """Test that empty stderr yields an empty summary."""
+        assert extract_error_summary([]) == ""
+        assert extract_error_summary(["", "   ", "+------"]) == ""
+
+    def test_picks_last_exception_line(self) -> None:
+        """Test that the last traceback-final line wins."""
+        lines = [
+            "Traceback (most recent call last):",
+            '  File "main.py", line 50, in app_lifespan',
+            "oracledb.exceptions.DatabaseError: ORA-01017: invalid username/password; logon denied",
+            "Help: https://docs.oracle.com/error-help/db/ora-01017/",
+        ]
+        summary = extract_error_summary(lines)
+        assert summary.startswith("oracledb.exceptions.DatabaseError: ORA-01017")
+
+    def test_strips_exception_group_decorations(self) -> None:
+        """Test that anyio exception-group prefixes are stripped."""
+        lines = [
+            "  +------------------------------------",
+            "  | oracledb.exceptions.DatabaseError: ORA-01017: invalid username/password",
+            "  +------------------------------------",
+        ]
+        summary = extract_error_summary(lines)
+        assert summary.startswith("oracledb.exceptions.DatabaseError")
+
+    def test_falls_back_to_last_nonempty_line(self) -> None:
+        """Test fallback when no line looks like an exception."""
+        lines = ["starting up...", "config invalid, aborting"]
+        assert extract_error_summary(lines) == "config invalid, aborting"
+
+    def test_node_style_error(self) -> None:
+        """Test Node.js style error lines are recognized."""
+        lines = ["some log", "Error: connect ECONNREFUSED 10.0.0.1:443", "    at TCPConnectWrap"]
+        assert extract_error_summary(lines) == "Error: connect ECONNREFUSED 10.0.0.1:443"
+
+    def test_summary_is_capped(self) -> None:
+        """Test that overly long lines are truncated."""
+        lines = ["RuntimeError: " + "x" * 1000]
+        assert len(extract_error_summary(lines)) == ERROR_SUMMARY_MAX_LEN
+
+
+class TestProcessStartError:
+    """Tests for the ProcessStartError raised on startup failures."""
+
+    def test_message_includes_summary(self) -> None:
+        """Test that the exception message carries the summary."""
+        exc = ProcessStartError("oracle", "ORA-01017: logon denied", "tail")
+        assert "oracle" in str(exc)
+        assert "ORA-01017" in str(exc)
+        assert exc.summary == "ORA-01017: logon denied"
+        assert exc.stderr_tail == "tail"
+
+    def test_message_without_summary(self) -> None:
+        """Test the exception message when stderr was empty."""
+        exc = ProcessStartError("oracle", "", "")
+        assert str(exc) == "MCP server process for 'oracle' failed to start"
+
+    async def test_crashing_process_reports_stderr(self) -> None:
+        """End-to-end: a crashing stdio server surfaces its stderr in the error.
+
+        Spawns a real subprocess that writes a traceback-style message to
+        stderr and exits — exercising the pipe tee and the drain logic.
+        """
+        pool = ProcessPool(idle_timeout=10, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-c",
+                    (
+                        "import sys; "
+                        "sys.stderr.write('Traceback (most recent call last):\\n'); "
+                        "sys.stderr.write('DatabaseError: ORA-01017: logon denied\\n'); "
+                        "sys.exit(1)"
+                    ),
+                ],
+            )
+            with pytest.raises(ProcessStartError) as exc_info:
+                await pool.get_or_create(
+                    server_name="crashing-server",
+                    params=params,
+                    header_env_vars={},
+                )
+            assert "ORA-01017" in exc_info.value.summary
+            assert "ORA-01017" in exc_info.value.stderr_tail
+        finally:
+            await pool.shutdown()
