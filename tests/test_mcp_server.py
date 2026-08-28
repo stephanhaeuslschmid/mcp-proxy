@@ -6,6 +6,7 @@ import contextlib
 import typing as t
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
+import anyio
 import pytest
 import uvicorn
 from mcp import types
@@ -18,8 +19,14 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.routing import Mount
 
-from mcp_proxy.mcp_server import MCPServerSettings, create_single_instance_routes, run_mcp_server
+from mcp_proxy.mcp_server import (
+    MCPServerSettings,
+    create_dynamic_server_routes,
+    create_single_instance_routes,
+    run_mcp_server,
+)
 
 
 def create_starlette_app(
@@ -689,3 +696,66 @@ async def test_run_mcp_server_both_default_and_named_servers(
         )
 
         mock_server_instance.serve.assert_called_once()
+
+
+class TestDeadPooledProcessInvalidation:
+    """A pooled process that died must be dropped, not kept and reused.
+
+    Production, 2026-08-27: talking to a dead child raises anyio's
+    ClosedResourceError, which is not an OSError. The handler only caught the
+    built-in socket errors, so the pool never learned the entry was broken and
+    served it to every later request for 30 hours.
+    """
+
+    @staticmethod
+    def _pooled_mcp_app(pool: MagicMock) -> t.Any:
+        """Build the pooled /mcp handler wired to the given pool."""
+        with (
+            patch("mcp_proxy.mcp_server.is_pool_enabled", return_value=True),
+            patch("mcp_proxy.mcp_server.get_process_pool", return_value=pool),
+        ):
+            routes = create_dynamic_server_routes(
+                server_name="oracle",
+                params=StdioServerParameters(command="echo", args=["test"]),
+                header_mapping={"X-Token": "TOKEN"},
+                header_to_args=[],
+                stateless_instance=True,
+            )
+        # The Mount carries the raw handler, which is what we want to drive.
+        return next(r for r in routes if isinstance(r, Mount)).app
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            anyio.ClosedResourceError(),
+            anyio.BrokenResourceError(),
+            BrokenPipeError(),
+            ConnectionResetError(),
+        ],
+    )
+    async def test_dead_process_error_invalidates_the_pool_entry(
+        self,
+        error: Exception,
+    ) -> None:
+        """Every "the child is gone" error must invalidate the cached process."""
+        handle = MagicMock()
+        handle.cache_key = "cafe1234"
+        handle.session = MagicMock()
+        handle.release = AsyncMock()
+
+        pool = MagicMock()
+        pool.get_or_create = AsyncMock(return_value=handle)
+        pool.invalidate = AsyncMock()
+
+        scope = {"type": "http", "path": "/mcp", "method": "POST", "headers": []}
+
+        with patch("mcp_proxy.mcp_server.get_process_pool", return_value=pool):
+            app = self._pooled_mcp_app(pool)
+            with (
+                patch("mcp_proxy.mcp_server.create_proxy_server", side_effect=error),
+                pytest.raises(type(error)),
+            ):
+                await app(scope, AsyncMock(), AsyncMock())
+
+        pool.invalidate.assert_awaited_once_with("cafe1234")
+        handle.release.assert_awaited_once()

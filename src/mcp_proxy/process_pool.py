@@ -90,12 +90,17 @@ def _leaf_exception_message(exc: BaseException) -> str:
 _DEFAULT_IDLE_TIMEOUT = int(os.environ.get("PROCESS_POOL_IDLE_TIMEOUT", "600"))
 _DEFAULT_MAX_SIZE = int(os.environ.get("PROCESS_POOL_MAX_SIZE", "100"))
 _DEFAULT_ENABLED = os.environ.get("PROCESS_POOL_ENABLED", "true").lower() == "true"
+# How long a process may hold references without completing a single request
+# before it counts as stalled. Must stay above the longest legitimate call any
+# caller makes, otherwise a slow-but-healthy server gets torn down under it.
+_DEFAULT_STALLED_TIMEOUT = int(os.environ.get("PROCESS_POOL_STALLED_TIMEOUT", "300"))
 PROCESS_POOL_CLEANUP_INTERVAL = 60  # Check for idle processes every 60 seconds
 
 # Runtime configuration (can be updated via configure_pool)
 _pool_enabled: bool = _DEFAULT_ENABLED
 _pool_idle_timeout: int = _DEFAULT_IDLE_TIMEOUT
 _pool_max_size: int = _DEFAULT_MAX_SIZE
+_pool_stalled_timeout: int = _DEFAULT_STALLED_TIMEOUT
 
 # Legacy exports for backwards compatibility
 PROCESS_POOL_IDLE_TIMEOUT = _DEFAULT_IDLE_TIMEOUT
@@ -107,6 +112,7 @@ def configure_pool(
     enabled: bool | None = None,
     idle_timeout: int | None = None,
     max_size: int | None = None,
+    stalled_timeout: int | None = None,
 ) -> None:
     """Configure pool settings from config.json (overrides ENV defaults).
 
@@ -114,8 +120,10 @@ def configure_pool(
         enabled: Whether the process pool is enabled
         idle_timeout: Seconds after which idle processes are terminated
         max_size: Maximum number of processes to cache
+        stalled_timeout: Seconds a process may hold references without
+            completing a request before it counts as stalled
     """
-    global _pool_enabled, _pool_idle_timeout, _pool_max_size  # noqa: PLW0603
+    global _pool_enabled, _pool_idle_timeout, _pool_max_size, _pool_stalled_timeout  # noqa: PLW0603
 
     if enabled is not None:
         _pool_enabled = enabled
@@ -126,6 +134,9 @@ def configure_pool(
     if max_size is not None:
         _pool_max_size = max_size
         logger.info("Process pool max size: %d (from config)", max_size)
+    if stalled_timeout is not None:
+        _pool_stalled_timeout = stalled_timeout
+        logger.info("Process pool stalled timeout: %ds (from config)", stalled_timeout)
 
 
 def is_pool_enabled() -> bool:
@@ -155,6 +166,15 @@ def get_pool_max_size() -> int:
     return _pool_max_size
 
 
+def get_pool_stalled_timeout() -> int:
+    """Get the configured stalled timeout for pooled processes.
+
+    Returns:
+        Seconds a process may hold references without completing a request.
+    """
+    return _pool_stalled_timeout
+
+
 @dataclass
 class CachedProcess:
     """Represents a cached MCP server process with its session."""
@@ -168,6 +188,8 @@ class CachedProcess:
     _owner_task: asyncio.Task[None]
     _reference_count: int = field(default=0, init=False)
     _marked_for_removal: bool = field(default=False, init=False)
+    _dead: bool = field(default=False, init=False)
+    _last_progress: datetime | None = field(default=None, init=False)
 
     def increment_ref(self) -> None:
         """Increment reference count when process is being used."""
@@ -176,6 +198,8 @@ class CachedProcess:
     def decrement_ref(self) -> None:
         """Decrement reference count when process usage is complete."""
         self._reference_count -= 1
+        # A returning request is the only proof that the child still answers.
+        self._last_progress = datetime.now(timezone.utc)
 
     @property
     def is_in_use(self) -> bool:
@@ -190,6 +214,57 @@ class CachedProcess:
     def is_marked_for_removal(self) -> bool:
         """Check if process is marked for removal."""
         return self._marked_for_removal
+
+    def mark_dead(self) -> None:
+        """Record that the child process is gone and the session unusable."""
+        self._dead = True
+
+    @property
+    def is_dead(self) -> bool:
+        """Check whether the child process has exited."""
+        return self._dead
+
+    def is_stalled(self, now: datetime, stalled_timeout: int) -> bool:
+        """Check whether this process holds references but stopped answering.
+
+        A hung request never reaches its ``finally``, so its reference is never
+        given back. Reference count alone therefore cannot tell a busy process
+        from a wedged one — the difference is whether anything has come back at
+        all within the timeout.
+
+        Args:
+            now: Current time
+            stalled_timeout: Seconds without a completed request before the
+                process counts as stalled
+
+        Returns:
+            True if the process is in use and has completed nothing for longer
+            than ``stalled_timeout``.
+        """
+        if not self.is_in_use:
+            return False
+        since = self._last_progress or self.created_at
+        return (now - since).total_seconds() > stalled_timeout
+
+    def is_reclaimable(self, now: datetime, stalled_timeout: int) -> bool:
+        """Check whether this entry may be removed from the pool right now.
+
+        An unused process is always safe to remove. A dead or stalled one MUST
+        be removable despite its reference count, because those references are
+        held by requests that will never return — waiting for the count to fall
+        to zero would keep the entry (and with it a broken server) forever.
+
+        Args:
+            now: Current time
+            stalled_timeout: Seconds without a completed request before the
+                process counts as stalled
+
+        Returns:
+            True if the entry can be popped and terminated.
+        """
+        if not self.is_in_use:
+            return True
+        return self.is_dead or self.is_stalled(now, stalled_timeout)
 
 
 @dataclass
@@ -234,6 +309,31 @@ def generate_cache_key(
     args_str = json.dumps(extra_args or [])
     key_string = f"{server_name}:{sorted_env}:{args_str}"
     return hashlib.sha256(key_string.encode()).hexdigest()
+
+
+def _unusable_reason(
+    cached: CachedProcess,
+    now: datetime,
+    stalled_timeout: int,
+) -> str | None:
+    """Describe why a cached process must not be handed out, if it must not.
+
+    Args:
+        cached: The cached process to judge
+        now: Current time
+        stalled_timeout: Seconds without a completed request before the process
+            counts as stalled
+
+    Returns:
+        A short reason for the log, or None if the process is fine to reuse.
+    """
+    if cached.is_dead:
+        return "dead (child process exited)"
+    if cached.is_marked_for_removal:
+        return "marked for removal"
+    if cached.is_stalled(now, stalled_timeout):
+        return f"stalled (no completed request for over {stalled_timeout}s)"
+    return None
 
 
 class ProcessPool:
@@ -343,6 +443,11 @@ class ProcessPool:
     async def _terminate_process(self, cached: CachedProcess, timeout: float = 5.0) -> None:
         """Terminate a cached process by signaling its owner task."""
         cached._shutdown_event.set()
+        if cached._owner_task.done():
+            # Already gone (crashed child, or a previous termination). Awaiting
+            # it again would only re-raise what the owner task already logged.
+            cached.mark_dead()
+            return
         try:
             await asyncio.wait_for(cached._owner_task, timeout=timeout)
         except asyncio.TimeoutError:
@@ -400,12 +505,25 @@ class ProcessPool:
         See: https://github.com/modelcontextprotocol/python-sdk/issues/577
         """
         now = datetime.now(timezone.utc)
+        stalled_timeout = get_pool_stalled_timeout()
         marked_count = 0
 
         async with self._lock:
             for cached in self._pool.values():
                 if cached.is_marked_for_removal:
                     continue  # Already marked
+                # A stalled process is the one case the idle rule cannot see:
+                # it looks permanently busy because its hung requests never
+                # give their references back.
+                if cached.is_stalled(now, stalled_timeout):
+                    cached.mark_for_removal()
+                    marked_count += 1
+                    logger.warning(
+                        "Process for %s answered nothing for over %ds, marked for lazy cleanup",
+                        cached.server_name,
+                        stalled_timeout,
+                    )
+                    continue
                 idle_seconds = (now - cached.last_used).total_seconds()
                 if idle_seconds > self._idle_timeout and not cached.is_in_use:
                     cached.mark_for_removal()
@@ -431,12 +549,14 @@ class ProcessPool:
         """
         # Collect marked processes under lock, then close outside lock
         to_cleanup: list[CachedProcess] = []
+        now = datetime.now(timezone.utc)
+        stalled_timeout = get_pool_stalled_timeout()
 
         async with self._lock:
             marked_keys = [
                 key
                 for key, cached in self._pool.items()
-                if cached.is_marked_for_removal and not cached.is_in_use
+                if cached.is_marked_for_removal and cached.is_reclaimable(now, stalled_timeout)
             ]
             for key in marked_keys:
                 to_cleanup.append(self._pool.pop(key))
@@ -488,29 +608,38 @@ class ProcessPool:
         # Check for marked process that needs cleanup (outside lock for aclose)
         marked_process_to_cleanup: CachedProcess | None = None
 
+        now = datetime.now(timezone.utc)
+        stalled_timeout = get_pool_stalled_timeout()
+
         async with self._lock:
             # Check if we have a cached process
             if cache_key in self._pool:
                 cached = self._pool[cache_key]
 
-                # Skip if marked for removal - clean it up and create new
-                if cached.is_marked_for_removal:
-                    if not cached.is_in_use:
-                        # Safe to remove and cleanup
+                # A cache hit is only worth having if the child is still there
+                # and still answering. Handing out a dead session produced 30
+                # hours of failing Oracle calls in production on 2026-08-27:
+                # every request was logged as a cache hit and then died on the
+                # closed stdio stream, and nothing ever replaced the entry.
+                unusable_reason = _unusable_reason(cached, now, stalled_timeout)
+                if unusable_reason:
+                    if cached.is_reclaimable(now, stalled_timeout):
                         marked_process_to_cleanup = self._pool.pop(cache_key)
                         logger.info(
-                            "Cached process for %s is marked for removal, will cleanup and create new",
+                            "Cached process for %s is %s, will cleanup and create new",
                             server_name,
+                            unusable_reason,
                         )
                     else:
-                        # Still in use by another request, leave it for later cleanup
+                        # Still serving another request, leave it for later cleanup
                         logger.info(
-                            "Cached process for %s is marked but still in use, creating new",
+                            "Cached process for %s is %s but still in use, creating new",
                             server_name,
+                            unusable_reason,
                         )
                 else:
                     # Process is healthy, use it
-                    cached.last_used = datetime.now(timezone.utc)
+                    cached.last_used = now
                     cached.increment_ref()
                     logger.info(
                         "Process cache hit for %s (key: %s)",
@@ -573,6 +702,10 @@ class ProcessPool:
             _shutdown_event=shutdown_event,
             _owner_task=owner_task,
         )
+        # The owner task holds the child's context open, so its completion is
+        # exactly the moment the session stops working — whether the child
+        # crashed or we shut it down ourselves.
+        owner_task.add_done_callback(lambda _: cached_process.mark_dead())
         cached_process.increment_ref()
 
         # Add to cache if not at max size (need lock for pool modification)

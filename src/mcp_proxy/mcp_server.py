@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import anyio
 import uvicorn
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -32,6 +33,20 @@ from .process_pool import (
 from .proxy_server import create_proxy_server
 
 logger = logging.getLogger(__name__)
+
+# Errors that mean "this pooled process is gone", so its entry must not survive
+# the request. The anyio pair is not optional: talking to a dead child raises
+# ClosedResourceError from the memory stream, which is NOT an OSError, so a
+# tuple of built-in socket errors alone lets a dead process stay cached and
+# fail every later request. That is how one production Oracle connection stayed
+# broken for 30 hours on 2026-08-27.
+_DEAD_PROCESS_ERRORS = (
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+    BrokenPipeError,
+    ConnectionResetError,
+    OSError,
+)
 
 
 @dataclass
@@ -196,7 +211,7 @@ def create_dynamic_server_routes(
                 )
         except ProcessStartError as e:
             return _process_start_error_response(server_name, e)
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        except _DEAD_PROCESS_ERRORS as e:
             logger.warning(
                 "Connection error for %s, invalidating cached process: %s",
                 server_name,
@@ -264,7 +279,7 @@ def create_dynamic_server_routes(
             # can still answer with a proper error payload.
             response = _process_start_error_response(server_name, e)
             await response(scope, receive, send)
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+        except _DEAD_PROCESS_ERRORS as e:
             logger.warning(
                 "Connection error for %s, invalidating cached process: %s",
                 server_name,

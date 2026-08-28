@@ -1201,3 +1201,222 @@ class TestProcessStartError:
             assert "ORA-01017" in exc_info.value.stderr_tail
         finally:
             await pool.shutdown()
+
+
+class TestDeadAndStalledProcesses:
+    """Tests for evicting processes that died or stopped answering.
+
+    Production, 2026-08-27: an Oracle server wedged behind an internal lock.
+    Every later request was logged as a cache hit, hung for minutes and failed,
+    for 30 hours, because the pool had no way to notice either condition.
+    """
+
+    @staticmethod
+    def _mock_stdio_and_session(
+        mock_stdio: MagicMock,
+        mock_session_class: MagicMock,
+    ) -> None:
+        """Wire the two patched constructors to a working fake process."""
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+    @staticmethod
+    def _cached(*, in_use: int = 0, age_seconds: float = 0.0) -> CachedProcess:
+        """Build a CachedProcess without starting anything."""
+        created = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        cached = CachedProcess(
+            server_name="test-server",
+            cache_key="key",
+            created_at=created,
+            last_used=created,
+            session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(),
+        )
+        for _ in range(in_use):
+            cached.increment_ref()
+        return cached
+
+    def test_idle_process_is_never_stalled(self) -> None:
+        """A process nobody is using cannot be stalled, however old it is."""
+        cached = self._cached(in_use=0, age_seconds=10_000)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_busy_process_within_timeout_is_not_stalled(self) -> None:
+        """A slow but legitimate call must not be torn down under the caller."""
+        cached = self._cached(in_use=1, age_seconds=100)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_busy_process_past_timeout_is_stalled(self) -> None:
+        """In use, nothing completed, past the timeout: wedged."""
+        cached = self._cached(in_use=1, age_seconds=400)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is True
+
+    def test_completed_request_resets_the_stall_clock(self) -> None:
+        """A returning request proves the child still answers."""
+        cached = self._cached(in_use=2, age_seconds=400)
+        cached.decrement_ref()  # one of the two calls came back
+        assert cached.is_in_use is True
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_reclaimable_only_when_unused_dead_or_stalled(self) -> None:
+        """A healthy busy process stays; a dead or stalled one must go."""
+        now = datetime.now(timezone.utc)
+
+        unused = self._cached(in_use=0)
+        assert unused.is_reclaimable(now, 300) is True
+
+        busy = self._cached(in_use=1)
+        assert busy.is_reclaimable(now, 300) is False
+
+        dead = self._cached(in_use=1)
+        dead.mark_dead()
+        assert dead.is_reclaimable(now, 300) is True
+
+        stalled = self._cached(in_use=1, age_seconds=400)
+        assert stalled.is_reclaimable(now, 300) is True
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_dead_process_is_replaced_not_served(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """A cache hit on a dead process must start a new one instead."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await handle.release()
+            first = pool._pool[handle.cache_key]
+
+            # The child exits: the owner task finishes and the entry is dead.
+            first.mark_dead()
+
+            second_handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await second_handle.release()
+
+            assert pool.get_cached_count() == 1
+            assert pool._pool[second_handle.cache_key] is not first
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_stalled_process_is_replaced_despite_held_references(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The production case: hung calls hold references that never return."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            # Deliberately NOT released: this is the hung request.
+            wedged = pool._pool[handle.cache_key]
+            wedged.created_at = datetime.now(timezone.utc) - timedelta(seconds=400)
+            assert wedged.is_in_use is True
+
+            second_handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await second_handle.release()
+
+            assert pool.get_cached_count() == 1
+            assert pool._pool[second_handle.cache_key] is not wedged
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_idle_sweep_marks_stalled_process(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The background sweep must reach a wedged process too."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            wedged = pool._pool[handle.cache_key]
+            wedged.created_at = datetime.now(timezone.utc) - timedelta(seconds=400)
+
+            # Not idle at all — last_used is now — but stalled.
+            await pool._cleanup_idle_processes()
+            assert wedged.is_marked_for_removal is True
+
+            await pool._cleanup_marked_processes()
+            assert pool.get_cached_count() == 0
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_owner_task_completion_marks_process_dead(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The owner task ending is what tells the pool the session is gone."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await handle.release()
+            cached = pool._pool[handle.cache_key]
+            assert cached.is_dead is False
+
+            # End the owner task the way a crashed child would.
+            cached._shutdown_event.set()
+            await cached._owner_task
+            await asyncio.sleep(0)  # let the done-callback run
+
+            assert cached.is_dead is True
+        finally:
+            await pool.shutdown()
