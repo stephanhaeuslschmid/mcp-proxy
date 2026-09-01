@@ -1,0 +1,1422 @@
+"""Tests for the process pool."""
+# ruff: noqa: PLR2004
+
+import asyncio
+import sys
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from mcp.client.stdio import StdioServerParameters
+
+from mcp_proxy.process_pool import (
+    ERROR_SUMMARY_MAX_LEN,
+    CachedProcess,
+    ProcessHandle,
+    ProcessPool,
+    ProcessStartError,
+    extract_error_summary,
+    generate_cache_key,
+    get_process_pool,
+    init_process_pool,
+    shutdown_process_pool,
+)
+
+
+class TestGenerateCacheKey:
+    """Tests for cache key generation."""
+
+    def test_generate_cache_key_deterministic(self) -> None:
+        """Test that cache key generation is deterministic."""
+        env_vars = {"TOKEN": "abc123", "USER": "test"}
+        key1 = generate_cache_key("server1", env_vars)
+        key2 = generate_cache_key("server1", env_vars)
+        assert key1 == key2
+
+    def test_generate_cache_key_same_env_same_key(self) -> None:
+        """Test that same env vars produce same cache key regardless of order."""
+        env_vars1 = {"TOKEN": "abc123", "USER": "test"}
+        env_vars2 = {"USER": "test", "TOKEN": "abc123"}
+        key1 = generate_cache_key("server1", env_vars1)
+        key2 = generate_cache_key("server1", env_vars2)
+        assert key1 == key2
+
+    def test_generate_cache_key_different_env_different_key(self) -> None:
+        """Test that different env vars produce different cache keys."""
+        env_vars1 = {"TOKEN": "abc123"}
+        env_vars2 = {"TOKEN": "xyz789"}
+        key1 = generate_cache_key("server1", env_vars1)
+        key2 = generate_cache_key("server1", env_vars2)
+        assert key1 != key2
+
+    def test_generate_cache_key_different_server_different_key(self) -> None:
+        """Test that different server names produce different cache keys."""
+        env_vars = {"TOKEN": "abc123"}
+        key1 = generate_cache_key("server1", env_vars)
+        key2 = generate_cache_key("server2", env_vars)
+        assert key1 != key2
+
+    def test_generate_cache_key_empty_env(self) -> None:
+        """Test cache key generation with empty env vars."""
+        key1 = generate_cache_key("server1", {})
+        key2 = generate_cache_key("server1", {})
+        assert key1 == key2
+        assert len(key1) == 64  # SHA256 produces 64 hex characters
+
+
+class TestCachedProcess:
+    """Tests for CachedProcess dataclass."""
+
+    def test_reference_count_operations(self) -> None:
+        """Test reference count increment and decrement."""
+        cached = CachedProcess(
+            server_name="test",
+            cache_key="key123",
+            created_at=datetime.now(timezone.utc),
+            last_used=datetime.now(timezone.utc),
+            session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(spec=asyncio.Task),
+        )
+
+        assert not cached.is_in_use
+        cached.increment_ref()
+        assert cached.is_in_use
+        cached.increment_ref()
+        assert cached.is_in_use
+        cached.decrement_ref()
+        assert cached.is_in_use
+        cached.decrement_ref()
+        assert not cached.is_in_use
+
+    def test_mark_for_removal(self) -> None:
+        """Test marking process for lazy removal."""
+        cached = CachedProcess(
+            server_name="test",
+            cache_key="key123",
+            created_at=datetime.now(timezone.utc),
+            last_used=datetime.now(timezone.utc),
+            session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(spec=asyncio.Task),
+        )
+
+        assert not cached.is_marked_for_removal
+        cached.mark_for_removal()
+        assert cached.is_marked_for_removal
+
+
+class TestProcessPool:
+    """Tests for ProcessPool class."""
+
+    @pytest.fixture
+    def pool(self) -> ProcessPool:
+        """Create a fresh ProcessPool for testing."""
+        return ProcessPool(idle_timeout=10, max_size=5)
+
+    @pytest.fixture
+    def mock_params(self) -> StdioServerParameters:
+        """Create mock stdio parameters."""
+        return StdioServerParameters(
+            command="echo",
+            args=["hello"],
+            env={"BASE_VAR": "value"},
+        )
+
+    @pytest.fixture
+    def mock_stdio_client(self) -> MagicMock:
+        """Create a mock stdio_client context manager."""
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_context = AsyncMock()
+        mock_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_context.__aexit__.return_value = None
+
+        return mock_context
+
+    @pytest.fixture
+    def mock_session(self) -> MagicMock:
+        """Create a mock ClientSession."""
+        mock = MagicMock()
+        mock.initialize = AsyncMock()
+        return mock
+
+    async def test_pool_start_creates_cleanup_task(self, pool: ProcessPool) -> None:
+        """Test that start() creates the cleanup task."""
+        assert pool._cleanup_task is None
+        await pool.start()
+        assert pool._cleanup_task is not None
+        await pool.shutdown()
+
+    async def test_pool_start_idempotent(self, pool: ProcessPool) -> None:
+        """Test that start() can be called multiple times safely."""
+        await pool.start()
+        task1 = pool._cleanup_task
+        await pool.start()  # Second call should not create new task
+        assert pool._cleanup_task is task1
+        await pool.shutdown()
+
+    async def test_get_cached_count_empty(self, pool: ProcessPool) -> None:
+        """Test get_cached_count returns 0 for empty pool."""
+        assert pool.get_cached_count() == 0
+
+    async def test_invalidate_nonexistent_key(self, pool: ProcessPool) -> None:
+        """Test invalidate with non-existent key doesn't raise."""
+        await pool.invalidate("nonexistent_key")  # Should not raise
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_get_or_create_cache_miss(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        pool: ProcessPool,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test get_or_create on cache miss creates new process."""
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+
+        assert handle is not None
+        assert handle.session is mock_session
+        assert pool.get_cached_count() == 1
+
+        await handle.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_get_or_create_cache_hit(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        pool: ProcessPool,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test get_or_create on cache hit returns cached process."""
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        # First call - cache miss
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+        await handle1.release()
+
+        # Second call - cache hit
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+
+        # Should reuse the same session
+        assert handle2.session is handle1.session
+        assert pool.get_cached_count() == 1
+        # stdio_client should only be called once
+        assert mock_stdio.call_count == 1
+
+        await handle2.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_get_or_create_different_env_creates_new(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        pool: ProcessPool,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test that different env vars create new processes."""
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        # First call with token A
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "tokenA"},
+        )
+        await handle1.release()
+
+        # Second call with token B
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "tokenB"},
+        )
+
+        # Should have created two separate processes
+        assert pool.get_cached_count() == 2
+        assert mock_stdio.call_count == 2
+
+        await handle2.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_invalidate_removes_process(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        pool: ProcessPool,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test that invalidate removes process from cache."""
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+        cache_key = handle.cache_key
+        await handle.release()
+
+        assert pool.get_cached_count() == 1
+
+        await pool.invalidate(cache_key)
+
+        assert pool.get_cached_count() == 0
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_shutdown_clears_pool(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        pool: ProcessPool,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test that shutdown clears all processes from pool."""
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        # Create a few processes
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "token1"},
+        )
+        await handle1.release()
+
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=mock_params,
+            header_env_vars={"TOKEN": "token2"},
+        )
+        await handle2.release()
+
+        assert pool.get_cached_count() == 2
+
+        await pool.shutdown()
+
+        assert pool.get_cached_count() == 0
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_max_size_limit(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+        mock_params: StdioServerParameters,
+    ) -> None:
+        """Test that pool respects max_size limit."""
+        pool = ProcessPool(idle_timeout=10, max_size=2)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        # Create more processes than max_size
+        handles = []
+        for i in range(4):
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=mock_params,
+                header_env_vars={"TOKEN": f"token{i}"},
+            )
+            handles.append(handle)
+            await handle.release()
+
+        # Pool should only cache max_size processes
+        assert pool.get_cached_count() == 2
+
+        await pool.shutdown()
+
+    # Note: test_dead_process_removed_on_get was removed because the process pool
+    # does not actively check for dead processes via at_eof(). Instead, the caller
+    # (mcp_server.py) catches exceptions and calls invalidate() to remove dead processes.
+    # Dead process detection is handled by the caller's error handling, not the pool itself.
+
+
+class TestProcessHandle:
+    """Tests for ProcessHandle class."""
+
+    async def test_handle_as_context_manager(self) -> None:
+        """Test that ProcessHandle works as async context manager."""
+        mock_pool = MagicMock()
+        mock_cached = MagicMock()
+        mock_cached.decrement_ref = MagicMock()
+
+        handle = ProcessHandle(
+            session=MagicMock(),
+            cache_key="test_key",
+            _pool=mock_pool,
+            _cached_process=mock_cached,
+        )
+
+        async with handle:
+            pass
+
+        mock_cached.decrement_ref.assert_called_once()
+
+    async def test_handle_release(self) -> None:
+        """Test that release() decrements reference count."""
+        mock_cached = MagicMock()
+        mock_cached.decrement_ref = MagicMock()
+
+        handle = ProcessHandle(
+            session=MagicMock(),
+            cache_key="test_key",
+            _pool=MagicMock(),
+            _cached_process=mock_cached,
+        )
+
+        await handle.release()
+
+        mock_cached.decrement_ref.assert_called_once()
+
+
+class TestGlobalPoolFunctions:
+    """Tests for global pool management functions."""
+
+    async def test_get_process_pool_singleton(self) -> None:
+        """Test that get_process_pool returns singleton."""
+        # Clear any existing pool
+        import mcp_proxy.process_pool as pp
+
+        pp._process_pool = None
+
+        pool1 = get_process_pool()
+        pool2 = get_process_pool()
+
+        assert pool1 is pool2
+
+        # Clean up
+        pp._process_pool = None
+
+    async def test_init_and_shutdown_process_pool(self) -> None:
+        """Test init and shutdown of global pool."""
+        import mcp_proxy.process_pool as pp
+
+        pp._process_pool = None
+
+        pool = await init_process_pool()
+        assert pool._started
+
+        await shutdown_process_pool()
+        assert pp._process_pool is None
+
+
+class TestIdleCleanup:
+    """Tests for idle process cleanup (lazy cleanup pattern)."""
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    @patch("mcp_proxy.process_pool.PROCESS_POOL_CLEANUP_INTERVAL", 0.1)
+    async def test_idle_process_marked_for_removal(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that idle processes are marked for lazy cleanup."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)  # 1 second timeout
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_exit_stack = AsyncMock()
+        mock_exit_stack.aclose = AsyncMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create a process
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+        await handle.release()
+
+        assert pool.get_cached_count() == 1
+
+        # Manually set last_used to be older than timeout
+        cache_key = handle.cache_key
+        pool._pool[cache_key].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+        # Run cleanup manually - this only MARKS the process, doesn't remove it yet
+        await pool._cleanup_idle_processes()
+
+        # Process is still in pool but marked for removal
+        assert pool.get_cached_count() == 1
+        assert pool._pool[cache_key].is_marked_for_removal
+
+        # Actual cleanup happens during next get_or_create (lazy cleanup)
+        await pool._cleanup_marked_processes()
+
+        # Now it should be removed
+        assert pool.get_cached_count() == 0
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    @patch("mcp_proxy.process_pool.PROCESS_POOL_CLEANUP_INTERVAL", 0.1)
+    async def test_lazy_cleanup_on_get_or_create(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that lazy cleanup happens during get_or_create."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create first process
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "token1"},
+        )
+        await handle1.release()
+
+        # Mark it for removal
+        cache_key1 = handle1.cache_key
+        pool._pool[cache_key1].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await pool._cleanup_idle_processes()
+        assert pool._pool[cache_key1].is_marked_for_removal
+
+        # Create second process with different token - this triggers lazy cleanup
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "token2"},
+        )
+        await handle2.release()
+
+        # First process should be cleaned up, second should be cached
+        assert pool.get_cached_count() == 1
+        assert cache_key1 not in pool._pool
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_active_process_not_cleaned(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that actively used processes are not cleaned up."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create a process but don't release it (simulates active use)
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+
+        # Manually set last_used to be older than timeout
+        cache_key = handle.cache_key
+        pool._pool[cache_key].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+        # Run cleanup manually - should NOT remove because process is in use
+        await pool._cleanup_idle_processes()
+
+        assert pool.get_cached_count() == 1  # Still there because in use
+
+        await handle.release()
+        await pool.shutdown()
+
+
+class TestOwnerTaskCleanup:
+    """Tests for owner task pattern (cancel scope bug fix)."""
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_cleanup_no_cancel_scope_error(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that cleanup works without RuntimeError (cancel scope)."""
+        pool = ProcessPool(idle_timeout=1, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create a process
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "test123"},
+        )
+        await handle.release()
+
+        assert pool.get_cached_count() == 1
+
+        # Mark it idle and run cleanup — this should NOT raise RuntimeError
+        cache_key = handle.cache_key
+        pool._pool[cache_key].last_used = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await pool._cleanup_idle_processes()
+        assert pool._pool[cache_key].is_marked_for_removal
+
+        # Actual cleanup via _cleanup_marked_processes — no cancel scope error
+        await pool._cleanup_marked_processes()
+
+        assert pool.get_cached_count() == 0
+
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_shutdown_terminates_owner_tasks(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that shutdown properly terminates all owner tasks."""
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+
+        # Setup mocks
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Create two processes
+        handle1 = await pool.get_or_create(
+            server_name="server-a",
+            params=params,
+            header_env_vars={"TOKEN": "token1"},
+        )
+        await handle1.release()
+
+        handle2 = await pool.get_or_create(
+            server_name="server-b",
+            params=params,
+            header_env_vars={"TOKEN": "token2"},
+        )
+        await handle2.release()
+
+        assert pool.get_cached_count() == 2
+
+        # Shutdown should cleanly terminate both — no RuntimeError
+        await pool.shutdown()
+
+        assert pool.get_cached_count() == 0
+
+
+class TestConcurrency:
+    """Tests for concurrent access handling."""
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_concurrent_get_or_create_same_key(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that concurrent requests for same key don't create duplicates."""
+        pool = ProcessPool(idle_timeout=600, max_size=100)
+
+        # Setup mocks with a delay to simulate slow process creation
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        async def slow_enter(_: MagicMock) -> tuple[MagicMock, MagicMock]:
+            await asyncio.sleep(0.1)  # Simulate slow startup
+            return (mock_reader, mock_writer)
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__ = slow_enter
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+        env_vars = {"TOKEN": "same_token"}
+
+        # Launch multiple concurrent requests for same key
+        tasks = [
+            pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars=env_vars,
+            )
+            for _ in range(5)
+        ]
+
+        handles = await asyncio.gather(*tasks)
+
+        # All handles should point to the same session
+        sessions = {h.session for h in handles}
+        # Due to the lock, only one process should be created
+        # But subsequent requests will wait and get the cached one
+        # The first request creates, others wait and reuse
+
+        # Release all handles
+        for handle in handles:
+            await handle.release()
+
+        # Should only have created one process
+        assert pool.get_cached_count() == 1
+
+        await pool.shutdown()
+
+
+class TestIntegration:
+    """Integration tests for process pool with mcp_server."""
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_first_request_cold_start(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that first request triggers cold start (cache miss)."""
+        pool = ProcessPool(idle_timeout=600, max_size=100)
+
+        # Track timing
+        call_times: list[float] = []
+
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        async def timed_enter(_: MagicMock) -> tuple[MagicMock, MagicMock]:
+            import time
+
+            call_times.append(time.time())
+            return (mock_reader, mock_writer)
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__ = timed_enter
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # First request - should trigger process creation (cold start)
+        handle = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "user_a_token"},
+        )
+
+        assert len(call_times) == 1  # Process was created
+        assert pool.get_cached_count() == 1
+
+        await handle.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_second_request_cache_hit(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that second request with same token uses cache (cache hit)."""
+        pool = ProcessPool(idle_timeout=600, max_size=100)
+
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+        token = {"TOKEN": "user_a_token"}
+
+        # First request - cold start
+        handle1 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars=token,
+        )
+        await handle1.release()
+
+        # Second request - cache hit
+        handle2 = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars=token,
+        )
+
+        # Should have only called stdio_client once
+        assert mock_stdio.call_count == 1
+        # Same session should be reused
+        assert handle2.session is handle1.session
+
+        await handle2.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_different_user_new_process(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test that request with different token creates new process."""
+        pool = ProcessPool(idle_timeout=600, max_size=100)
+
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        # Return different session objects for each call
+        sessions = [MagicMock() for _ in range(3)]
+        for s in sessions:
+            s.initialize = AsyncMock()
+
+        session_index = [0]
+
+        async def get_session(_: MagicMock) -> MagicMock:
+            idx = session_index[0]
+            session_index[0] += 1
+            return sessions[idx % len(sessions)]
+
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__ = get_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # User A request
+        handle_a = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "user_a_token"},
+        )
+        await handle_a.release()
+
+        # User B request (different token)
+        handle_b = await pool.get_or_create(
+            server_name="test-server",
+            params=params,
+            header_env_vars={"TOKEN": "user_b_token"},
+        )
+
+        # Should have created two processes
+        assert mock_stdio.call_count == 2
+        assert pool.get_cached_count() == 2
+
+        await handle_b.release()
+        await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_multi_user_scenario(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """Test realistic multi-user scenario with cache hits and misses."""
+        pool = ProcessPool(idle_timeout=600, max_size=100)
+
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+        await pool.start()
+
+        params = StdioServerParameters(command="echo", args=["test"])
+
+        # Simulate: User A, User A, User B, User B, User A
+        requests = [
+            {"TOKEN": "token_a"},  # Cold start
+            {"TOKEN": "token_a"},  # Cache hit
+            {"TOKEN": "token_b"},  # Cold start
+            {"TOKEN": "token_b"},  # Cache hit
+            {"TOKEN": "token_a"},  # Cache hit
+        ]
+
+        for env_vars in requests:
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars=env_vars,
+            )
+            await handle.release()
+
+        # Should have created 2 processes (one for each unique token)
+        assert mock_stdio.call_count == 2
+        assert pool.get_cached_count() == 2
+
+        await pool.shutdown()
+
+
+class TestExtractErrorSummary:
+    """Tests for extract_error_summary."""
+
+    def test_empty_lines(self) -> None:
+        """Test that empty stderr yields an empty summary."""
+        assert extract_error_summary([]) == ""
+        assert extract_error_summary(["", "   ", "+------"]) == ""
+
+    def test_picks_last_exception_line(self) -> None:
+        """Test that the last traceback-final line wins."""
+        lines = [
+            "Traceback (most recent call last):",
+            '  File "main.py", line 50, in app_lifespan',
+            "oracledb.exceptions.DatabaseError: ORA-01017: invalid username/password; logon denied",
+            "Help: https://docs.oracle.com/error-help/db/ora-01017/",
+        ]
+        summary = extract_error_summary(lines)
+        assert summary.startswith("oracledb.exceptions.DatabaseError: ORA-01017")
+
+    def test_strips_exception_group_decorations(self) -> None:
+        """Test that anyio exception-group prefixes are stripped."""
+        lines = [
+            "  +------------------------------------",
+            "  | oracledb.exceptions.DatabaseError: ORA-01017: invalid username/password",
+            "  +------------------------------------",
+        ]
+        summary = extract_error_summary(lines)
+        assert summary.startswith("oracledb.exceptions.DatabaseError")
+
+    def test_falls_back_to_last_nonempty_line(self) -> None:
+        """Test fallback when no line looks like an exception."""
+        lines = ["starting up...", "config invalid, aborting"]
+        assert extract_error_summary(lines) == "config invalid, aborting"
+
+    def test_node_style_error(self) -> None:
+        """Test Node.js style error lines are recognized."""
+        lines = ["some log", "Error: connect ECONNREFUSED 10.0.0.1:443", "    at TCPConnectWrap"]
+        assert extract_error_summary(lines) == "Error: connect ECONNREFUSED 10.0.0.1:443"
+
+    def test_summary_is_capped(self) -> None:
+        """Test that overly long lines are truncated."""
+        lines = ["RuntimeError: " + "x" * 1000]
+        assert len(extract_error_summary(lines)) == ERROR_SUMMARY_MAX_LEN
+
+
+class TestProcessStartError:
+    """Tests for the ProcessStartError raised on startup failures."""
+
+    def test_message_includes_summary(self) -> None:
+        """Test that the exception message carries the summary."""
+        exc = ProcessStartError("oracle", "ORA-01017: logon denied", "tail")
+        assert "oracle" in str(exc)
+        assert "ORA-01017" in str(exc)
+        assert exc.summary == "ORA-01017: logon denied"
+        assert exc.stderr_tail == "tail"
+
+    def test_message_without_summary(self) -> None:
+        """Test the exception message when stderr was empty."""
+        exc = ProcessStartError("oracle", "", "")
+        assert str(exc) == "MCP server process for 'oracle' failed to start"
+
+    async def test_crashing_process_reports_stderr(self) -> None:
+        """End-to-end: a crashing stdio server surfaces its stderr in the error.
+
+        Spawns a real subprocess that writes a traceback-style message to
+        stderr and exits — exercising the pipe tee and the drain logic.
+        """
+        pool = ProcessPool(idle_timeout=10, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(
+                command=sys.executable,
+                args=[
+                    "-c",
+                    (
+                        "import sys; "
+                        "sys.stderr.write('Traceback (most recent call last):\\n'); "
+                        "sys.stderr.write('DatabaseError: ORA-01017: logon denied\\n'); "
+                        "sys.exit(1)"
+                    ),
+                ],
+            )
+            with pytest.raises(ProcessStartError) as exc_info:
+                await pool.get_or_create(
+                    server_name="crashing-server",
+                    params=params,
+                    header_env_vars={},
+                )
+            assert "ORA-01017" in exc_info.value.summary
+            assert "ORA-01017" in exc_info.value.stderr_tail
+        finally:
+            await pool.shutdown()
+
+
+class TestDeadAndStalledProcesses:
+    """Tests for evicting processes that died or stopped answering.
+
+    Production, 2026-08-27: an Oracle server wedged behind an internal lock.
+    Every later request was logged as a cache hit, hung for minutes and failed,
+    for 30 hours, because the pool had no way to notice either condition.
+    """
+
+    @staticmethod
+    def _mock_stdio_and_session(
+        mock_stdio: MagicMock,
+        mock_session_class: MagicMock,
+    ) -> None:
+        """Wire the two patched constructors to a working fake process."""
+        mock_reader = MagicMock()
+        mock_reader.at_eof.return_value = False
+        mock_writer = MagicMock()
+
+        mock_stdio_context = AsyncMock()
+        mock_stdio_context.__aenter__.return_value = (mock_reader, mock_writer)
+        mock_stdio_context.__aexit__.return_value = None
+        mock_stdio.return_value = mock_stdio_context
+
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session_context = AsyncMock()
+        mock_session_context.__aenter__.return_value = mock_session
+        mock_session_context.__aexit__.return_value = None
+        mock_session_class.return_value = mock_session_context
+
+    @staticmethod
+    def _cached(*, in_use: int = 0, age_seconds: float = 0.0) -> CachedProcess:
+        """Build a CachedProcess without starting anything."""
+        created = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        cached = CachedProcess(
+            server_name="test-server",
+            cache_key="key",
+            created_at=created,
+            last_used=created,
+            session=MagicMock(),
+            _shutdown_event=asyncio.Event(),
+            _owner_task=MagicMock(),
+        )
+        for _ in range(in_use):
+            cached.increment_ref()
+        return cached
+
+    def test_idle_process_is_never_stalled(self) -> None:
+        """A process nobody is using cannot be stalled, however old it is."""
+        cached = self._cached(in_use=0, age_seconds=10_000)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_busy_process_within_timeout_is_not_stalled(self) -> None:
+        """A slow but legitimate call must not be torn down under the caller."""
+        cached = self._cached(in_use=1, age_seconds=100)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_busy_process_past_timeout_is_stalled(self) -> None:
+        """In use, nothing completed, past the timeout: wedged."""
+        cached = self._cached(in_use=1, age_seconds=400)
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is True
+
+    def test_completed_request_resets_the_stall_clock(self) -> None:
+        """A returning request proves the child still answers."""
+        cached = self._cached(in_use=2, age_seconds=400)
+        cached.decrement_ref()  # one of the two calls came back
+        assert cached.is_in_use is True
+        assert cached.is_stalled(datetime.now(timezone.utc), 300) is False
+
+    def test_reclaimable_only_when_unused_dead_or_stalled(self) -> None:
+        """A healthy busy process stays; a dead or stalled one must go."""
+        now = datetime.now(timezone.utc)
+
+        unused = self._cached(in_use=0)
+        assert unused.is_reclaimable(now, 300) is True
+
+        busy = self._cached(in_use=1)
+        assert busy.is_reclaimable(now, 300) is False
+
+        dead = self._cached(in_use=1)
+        dead.mark_dead()
+        assert dead.is_reclaimable(now, 300) is True
+
+        stalled = self._cached(in_use=1, age_seconds=400)
+        assert stalled.is_reclaimable(now, 300) is True
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_dead_process_is_replaced_not_served(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """A cache hit on a dead process must start a new one instead."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await handle.release()
+            first = pool._pool[handle.cache_key]
+
+            # The child exits: the owner task finishes and the entry is dead.
+            first.mark_dead()
+
+            second_handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await second_handle.release()
+
+            assert pool.get_cached_count() == 1
+            assert pool._pool[second_handle.cache_key] is not first
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_stalled_process_is_replaced_despite_held_references(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The production case: hung calls hold references that never return."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            # Deliberately NOT released: this is the hung request.
+            wedged = pool._pool[handle.cache_key]
+            wedged.created_at = datetime.now(timezone.utc) - timedelta(seconds=400)
+            assert wedged.is_in_use is True
+
+            second_handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await second_handle.release()
+
+            assert pool.get_cached_count() == 1
+            assert pool._pool[second_handle.cache_key] is not wedged
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_idle_sweep_marks_stalled_process(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The background sweep must reach a wedged process too."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            wedged = pool._pool[handle.cache_key]
+            wedged.created_at = datetime.now(timezone.utc) - timedelta(seconds=400)
+
+            # Not idle at all — last_used is now — but stalled.
+            await pool._cleanup_idle_processes()
+            assert wedged.is_marked_for_removal is True
+
+            await pool._cleanup_marked_processes()
+            assert pool.get_cached_count() == 0
+        finally:
+            await pool.shutdown()
+
+    @patch("mcp_proxy.process_pool.stdio_client")
+    @patch("mcp_proxy.process_pool.ClientSession")
+    async def test_owner_task_completion_marks_process_dead(
+        self,
+        mock_session_class: MagicMock,
+        mock_stdio: MagicMock,
+    ) -> None:
+        """The owner task ending is what tells the pool the session is gone."""
+        self._mock_stdio_and_session(mock_stdio, mock_session_class)
+        pool = ProcessPool(idle_timeout=600, max_size=5)
+        await pool.start()
+        try:
+            params = StdioServerParameters(command="echo", args=["test"])
+            handle = await pool.get_or_create(
+                server_name="test-server",
+                params=params,
+                header_env_vars={"TOKEN": "test123"},
+            )
+            await handle.release()
+            cached = pool._pool[handle.cache_key]
+            assert cached.is_dead is False
+
+            # End the owner task the way a crashed child would.
+            cached._shutdown_event.set()
+            await cached._owner_task
+            await asyncio.sleep(0)  # let the done-callback run
+
+            assert cached.is_dead is True
+        finally:
+            await pool.shutdown()
